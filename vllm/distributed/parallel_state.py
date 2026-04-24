@@ -26,6 +26,7 @@ If you only need to use the distributed environment without model/pipeline
 import contextlib
 import gc
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -43,6 +44,7 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -510,10 +512,15 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if self.use_custom_op_call:
-            return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
-        else:
-            return self._all_reduce_out_place(input_)
+        return self._run_collective_with_timing(
+            "all_reduce",
+            input_,
+            lambda: (
+                torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+                if self.use_custom_op_call
+                else self._all_reduce_out_place(input_)
+            ),
+        )
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
@@ -529,12 +536,15 @@ class GroupCoordinator:
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
 
-        if self.use_custom_op_call:
-            return torch.ops.vllm.all_gather(
-                input_, dim, world_size, group_name=self.unique_name
-            )
-        else:
-            return self._all_gather_out_place(input_, dim)
+        return self._run_collective_with_timing(
+            "all_gather",
+            input_,
+            lambda: (
+                torch.ops.vllm.all_gather(input_, dim, world_size, group_name=self.unique_name)
+                if self.use_custom_op_call
+                else self._all_gather_out_place(input_, dim)
+            ),
+        )
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
@@ -549,7 +559,12 @@ class GroupCoordinator:
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_gatherv(input_, dim, sizes)
+        sample = input_[0] if isinstance(input_, list) and input_ else input_
+        return self._run_collective_with_timing(
+            "all_gatherv",
+            sample,
+            lambda: self.device_communicator.all_gatherv(input_, dim, sizes),
+        )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -560,19 +575,90 @@ class GroupCoordinator:
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
 
-        if self.use_custom_op_call:
-            return torch.ops.vllm.reduce_scatter(
-                input_, dim, world_size, group_name=self.unique_name
-            )
-        else:
-            return self._reduce_scatter_out_place(input_, dim)
+        return self._run_collective_with_timing(
+            "reduce_scatter",
+            input_,
+            lambda: (
+                torch.ops.vllm.reduce_scatter(
+                    input_, dim, world_size, group_name=self.unique_name
+                )
+                if self.use_custom_op_call
+                else self._reduce_scatter_out_place(input_, dim)
+            ),
+        )
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatterv(input_, dim, sizes)
+        return self._run_collective_with_timing(
+            "reduce_scatterv",
+            input_,
+            lambda: self.device_communicator.reduce_scatterv(input_, dim, sizes),
+        )
+
+    def _run_collective_with_timing(
+        self,
+        op_name: str,
+        sample_tensor: torch.Tensor,
+        fn: Callable[[], torch.Tensor],
+    ) -> torch.Tensor:
+        cfg = get_current_vllm_config()
+        do_timing = bool(
+            cfg is not None
+            and cfg.observability_config is not None
+            and cfg.observability_config.track_gpu_coll_op_timings
+            and sample_tensor.is_cuda
+            and torch.cuda.is_available()
+        )
+        if not do_timing:
+            return fn()
+
+        stream = torch.cuda.current_stream()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        in_shape = list(sample_tensor.shape)
+        in_dtype = str(sample_tensor.dtype)
+        in_numel = int(sample_tensor.numel())
+        in_bytes = int(in_numel * sample_tensor.element_size())
+        out = fn()
+        end_event.record(stream)
+        end_event.synchronize()
+        elapsed_us = float(start_event.elapsed_time(end_event) * 1000.0)
+        out_shape = list(out.shape)
+        out_dtype = str(out.dtype)
+        out_numel = int(out.numel())
+        out_bytes = int(out_numel * out.element_size())
+        try:
+            from vllm.tracing.moe_stats import get_moe_stats_tracer
+
+            tracer = get_moe_stats_tracer()
+            if tracer is not None:
+                tracer.write_gpu_timing_event(
+                    {
+                        "ts_unix_ns": time.time_ns(),
+                        "event": "gpu_collective_timing",
+                        "op_name": op_name,
+                        "gpu_elapsed_us": elapsed_us,
+                        "group_name": self.unique_name,
+                        "rank": self.rank,
+                        "rank_in_group": self.rank_in_group,
+                        "world_size": self.world_size,
+                        "input_shape": in_shape,
+                        "input_dtype": in_dtype,
+                        "input_numel": in_numel,
+                        "input_bytes": in_bytes,
+                        "output_shape": out_shape,
+                        "output_dtype": out_dtype,
+                        "output_numel": out_numel,
+                        "output_bytes": out_bytes,
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to write collective GPU timing event.", exc_info=True)
+        return out
 
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import TYPE_CHECKING, Any
+import time
 
 import torch
 import torch.nn as nn
@@ -767,18 +768,61 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
-
-    self.impl.forward(
-        self,
-        query,
-        key,
-        value,
-        kv_cache,
-        attn_metadata,
-        output=output,
-        output_scale=output_scale,
-        output_block_scale=output_block_scale,
+    vllm_config = get_current_vllm_config()
+    do_gpu_timing = bool(
+        vllm_config is not None
+        and vllm_config.observability_config is not None
+        and vllm_config.observability_config.track_gpu_op_timings
+        and query.is_cuda
+        and torch.cuda.is_available()
     )
+    if do_gpu_timing:
+        stream = torch.cuda.current_stream()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        self.impl.forward(
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        )
+        end_event.record(stream)
+        end_event.synchronize()
+        elapsed_us = float(start_event.elapsed_time(end_event) * 1000.0)
+        try:
+            from vllm.tracing.moe_stats import get_moe_stats_tracer
+
+            tracer = get_moe_stats_tracer()
+            if tracer is not None:
+                tracer.write_gpu_timing_event(
+                    {
+                        "ts_unix_ns": time.time_ns(),
+                        "event": "gpu_op_timing",
+                        "op_name": "attention_comp",
+                        "gpu_elapsed_us": elapsed_us,
+                        "layer_name": layer_name,
+                    }
+                )
+        except Exception:
+            logger.debug("Failed to write attention GPU timing event.", exc_info=True)
+    else:
+        self.impl.forward(
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        )
 
 
 def unified_attention_with_output_fake(

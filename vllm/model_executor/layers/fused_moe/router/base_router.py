@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
 from collections.abc import Callable
+import time
+from typing import Any
 
 import torch
 
@@ -162,6 +164,7 @@ class BaseRouter(FusedMoERouter):
         self.enable_eplb = enable_eplb
         self.indices_type_getter = indices_type_getter
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
+        self.last_invalid_expert_id_count: int = 0
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
         """Set a capture callback for logical routed expert IDs."""
@@ -275,6 +278,11 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, indices_type
         )
+        self.last_invalid_expert_id_count = int(
+            ((topk_ids < 0) | (topk_ids >= self.global_num_experts))
+            .sum()
+            .item()
+        )
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
@@ -287,3 +295,89 @@ class BaseRouter(FusedMoERouter):
         topk_ids = self._convert_indices_dtype(topk_ids, indices_type)
 
         return topk_weights, topk_ids
+
+    def build_moe_stats_event(
+        self,
+        *,
+        duration_us: float,
+        layer_name: str,
+        layer_id: int | None,
+        request_phase: str | None,
+        rank_info: dict[str, int | None],
+        request_scope: dict[str, int | None],
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> dict[str, Any]:
+        num_tokens = int(hidden_states.shape[0]) if hidden_states.ndim > 0 else 0
+        assignments_total = num_tokens * self.top_k
+        topk_ids_cpu = topk_ids.detach()
+        valid_ids = topk_ids_cpu[(topk_ids_cpu >= 0) & (topk_ids_cpu < self.global_num_experts)]
+        if valid_ids.numel() > 0:
+            valid_ids = valid_ids.to(dtype=torch.int64, device="cpu")
+            uniq, counts = torch.unique(valid_ids, return_counts=True)
+            per_expert_counts = {
+                str(int(expert_id)): int(count)
+                for expert_id, count in zip(uniq.tolist(), counts.tolist())
+            }
+            active_experts_count = len(per_expert_counts)
+            max_tokens_single_expert = max(per_expert_counts.values())
+            mean_tokens_per_active_expert = (
+                float(sum(per_expert_counts.values()) / active_experts_count)
+                if active_experts_count > 0
+                else 0.0
+            )
+        else:
+            per_expert_counts = {}
+            active_experts_count = 0
+            max_tokens_single_expert = 0
+            mean_tokens_per_active_expert = 0.0
+
+        topk_weight_sums = topk_weights.sum(dim=1) if topk_weights.ndim == 2 else None
+        topk_weight_sum_stats = (
+            {
+                "min": float(topk_weight_sums.min().item()),
+                "mean": float(topk_weight_sums.mean().item()),
+                "max": float(topk_weight_sums.max().item()),
+            }
+            if topk_weight_sums is not None and topk_weight_sums.numel() > 0
+            else None
+        )
+
+        routing_method = self.routing_method_type
+        return {
+            "ts_unix_ns": time.time_ns(),
+            "event": "moe_router_select_experts",
+            "duration_us": duration_us,
+            "layer_name": layer_name,
+            "layer_id": layer_id,
+            "request_phase": request_phase,
+            "rank": rank_info.get("rank"),
+            "dp_rank": rank_info.get("dp_rank"),
+            "ep_rank": rank_info.get("ep_rank"),
+            "tp_rank": rank_info.get("tp_rank"),
+            "request_scope": request_scope,
+            "router_type": self.__class__.__name__,
+            "routing_method_type": str(routing_method),
+            "top_k": self.top_k,
+            "num_global_experts": self.global_num_experts,
+            "renormalize": getattr(self, "renormalize", None),
+            "scoring_func": getattr(self, "scoring_func", None),
+            "hidden_states_shape": list(hidden_states.shape),
+            "hidden_states_dtype": str(hidden_states.dtype),
+            "router_logits_shape": list(router_logits.shape),
+            "router_logits_dtype": str(router_logits.dtype),
+            "topk_ids_shape": list(topk_ids.shape),
+            "topk_ids_dtype": str(topk_ids.dtype),
+            "topk_weights_shape": list(topk_weights.shape),
+            "topk_weights_dtype": str(topk_weights.dtype),
+            "num_tokens": num_tokens,
+            "assignments_total": assignments_total,
+            "per_expert_counts": per_expert_counts,
+            "active_experts_count": active_experts_count,
+            "max_tokens_single_expert": max_tokens_single_expert,
+            "mean_tokens_per_active_expert": mean_tokens_per_active_expert,
+            "topk_weight_sum_stats": topk_weight_sum_stats,
+            "invalid_expert_id_count": self.last_invalid_expert_id_count,
+        }

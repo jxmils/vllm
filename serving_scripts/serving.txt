@@ -1,0 +1,9 @@
+--enforce-eager 
+--disable-custom-all-reduce 
+
+--track-moe-stats-dir
+--track-moe-stats
+
+
+--track-gpu-op-timings
+--track-gpu-coll-op-timings

@@ -600,6 +600,10 @@ class EngineArgs:
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
+    track_moe_stats: bool = ObservabilityConfig.track_moe_stats
+    track_moe_stats_dir: str | None = ObservabilityConfig.track_moe_stats_dir
+    track_gpu_op_timings: bool = ObservabilityConfig.track_gpu_op_timings
+    track_gpu_coll_op_timings: bool = ObservabilityConfig.track_gpu_coll_op_timings
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
@@ -1272,6 +1276,22 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
+        )
+        observability_group.add_argument(
+            "--track-moe-stats",
+            **observability_kwargs["track_moe_stats"],
+        )
+        observability_group.add_argument(
+            "--track-moe-stats-dir",
+            **observability_kwargs["track_moe_stats_dir"],
+        )
+        observability_group.add_argument(
+            "--track-gpu-op-timings",
+            **observability_kwargs["track_gpu_op_timings"],
+        )
+        observability_group.add_argument(
+            "--track-gpu-coll-op-timings",
+            **observability_kwargs["track_gpu_coll_op_timings"],
         )
 
         # Scheduler arguments
@@ -2078,6 +2098,10 @@ class EngineArgs:
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
+            track_moe_stats=self.track_moe_stats,
+            track_moe_stats_dir=self.track_moe_stats_dir,
+            track_gpu_op_timings=self.track_gpu_op_timings,
+            track_gpu_coll_op_timings=self.track_gpu_coll_op_timings,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
         )

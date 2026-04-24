@@ -206,7 +206,7 @@ class ModelConfig:
     the `OnlineQuantScheme` enum."""
     allow_deprecated_quantization: bool = False
     """Whether to allow deprecated quantization methods."""
-    enforce_eager: bool = True
+    enforce_eager: bool = False
     """Whether to always use eager-mode PyTorch. If True, we will disable CUDA
     graph and always execute the model in eager mode. If False, we will use
     CUDA graph and eager execution in hybrid for maximal performance and

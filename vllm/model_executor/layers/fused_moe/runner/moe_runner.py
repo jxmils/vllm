@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from contextlib import nullcontext
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -26,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -37,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExpertsOrder,
 )
 from vllm.platforms import current_platform
+from vllm.tracing.moe_stats import get_moe_stats_tracer
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
     LayerName,
@@ -451,19 +456,80 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
             )
         else:
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
+            t0 = time.perf_counter_ns()
+            request_phase = self._infer_request_phase()
+            layer_id = None
+            try:
+                from vllm.model_executor.models.utils import extract_layer_index
+
+                layer_id = extract_layer_index(self.layer_name)
+            except Exception:
+                layer_id = None
+            request_scope = {"batch_id": None, "ubatch_id": None}
+            try:
+                from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+                request_scope["ubatch_id"] = int(dbo_current_ubatch_id())
+            except Exception:
+                request_scope["ubatch_id"] = None
+            rank_info = {
+                "rank": int(os.environ.get("RANK", "0")),
+                "dp_rank": self.moe_config.dp_rank,
+                "ep_rank": self.moe_config.ep_rank,
+                "tp_rank": self.moe_config.tp_rank,
+            }
+            topk_weights, topk_ids, gpu_topk_us = self._run_with_cuda_timing(
+                "moe_topk",
+                lambda: self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                ),
+                request_phase=request_phase,
+                layer_id=layer_id,
+                request_scope=request_scope,
+                rank_info=rank_info,
             )
+
+            duration_us = (time.perf_counter_ns() - t0) / 1_000.0
+            tracer = get_moe_stats_tracer()
+            if tracer is not None and isinstance(self.router, BaseRouter):
+                event = self.router.build_moe_stats_event(
+                    duration_us=duration_us,
+                    layer_name=self.layer_name,
+                    layer_id=layer_id,
+                    request_phase=request_phase,
+                    rank_info=rank_info,
+                    request_scope=request_scope,
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
+                if gpu_topk_us is not None:
+                    event["gpu_topk_us"] = gpu_topk_us
+                tracer.write_event(event)
+                selected_experts = topk_ids.detach().to("cpu", dtype=torch.int64).tolist()
+                tracer.add_layer_selection(
+                    layer_id=layer_id,
+                    request_phase=request_phase,
+                    selected_experts=selected_experts,
+                )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
-            fused_out = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_experts_input,
+            fused_out, _gpu_moe_us = self._run_with_cuda_timing(
+                "moe_experts",
+                lambda: self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                ),
+                request_phase=request_phase,
+                layer_id=layer_id,
+                request_scope=request_scope,
+                rank_info=rank_info,
             )
 
         self._maybe_apply_shared_experts(
@@ -475,6 +541,89 @@ class MoERunner(MoERunnerInterface):
             self._shared_experts.output if self._shared_experts is not None else None,
             fused_out,
         )
+
+    def _infer_request_phase(self) -> str | None:
+        """Best-effort classification of current MoE call phase."""
+        if not is_forward_context_available():
+            return None
+        ctx = get_forward_context()
+        attn_meta = ctx.attn_metadata
+        if isinstance(attn_meta, dict):
+            meta = attn_meta.get(self.layer_name)
+        elif isinstance(attn_meta, list):
+            idx = 0
+            try:
+                from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+                idx = int(dbo_current_ubatch_id())
+            except Exception:
+                idx = 0
+            meta_dict = attn_meta[idx] if 0 <= idx < len(attn_meta) else None
+            meta = meta_dict.get(self.layer_name) if isinstance(meta_dict, dict) else None
+        else:
+            meta = None
+
+        if meta is None:
+            return None
+        num_prefills = getattr(meta, "num_prefills", None)
+        num_decodes = getattr(meta, "num_decodes", None)
+        if isinstance(num_prefills, int) and isinstance(num_decodes, int):
+            if num_prefills > 0 and num_decodes == 0:
+                return "prefill"
+            if num_decodes > 0 and num_prefills == 0:
+                return "decode"
+            if num_prefills > 0 and num_decodes > 0:
+                return "mixed"
+        return None
+
+    def _run_with_cuda_timing(
+        self,
+        op_name: str,
+        fn: Callable[[], tuple[torch.Tensor, torch.Tensor] | torch.Tensor],
+        *,
+        request_phase: str | None,
+        layer_id: int | None,
+        request_scope: dict[str, int | None],
+        rank_info: dict[str, int | None],
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor] | torch.Tensor, float | None]:
+        cfg = get_current_vllm_config()
+        enabled = bool(
+            cfg is not None
+            and cfg.observability_config is not None
+            and cfg.observability_config.track_gpu_op_timings
+            and torch.cuda.is_available()
+        )
+        if not enabled:
+            return fn(), None
+
+        stream = torch.cuda.current_stream()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        result = fn()
+        end_event.record(stream)
+        end_event.synchronize()
+        elapsed_us = float(start_event.elapsed_time(end_event) * 1000.0)
+
+        tracer = get_moe_stats_tracer()
+        if tracer is not None:
+            tracer.write_gpu_timing_event(
+                {
+                    "ts_unix_ns": time.time_ns(),
+                    "event": "gpu_op_timing",
+                    "op_name": op_name,
+                    "gpu_elapsed_us": elapsed_us,
+                    "layer_name": self.layer_name,
+                    "layer_id": layer_id,
+                    "request_phase": request_phase,
+                    "request_scope": request_scope,
+                    "rank": rank_info.get("rank"),
+                    "dp_rank": rank_info.get("dp_rank"),
+                    "ep_rank": rank_info.get("ep_rank"),
+                    "tp_rank": rank_info.get("tp_rank"),
+                }
+            )
+        return result, elapsed_us
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token

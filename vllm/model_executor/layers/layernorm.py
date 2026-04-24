@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom normalization layers."""
 
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 import vllm.kernels  # noqa: F401
 from vllm import _oink_ops, envs, ir
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import (
@@ -18,6 +20,27 @@ from vllm.model_executor.layers.batch_invariant import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _trace_norm_gpu_timing(
+    op_name: str, elapsed_us: float, tensor: torch.Tensor
+) -> None:
+    try:
+        from vllm.tracing.moe_stats import get_moe_stats_tracer
+
+        tracer = get_moe_stats_tracer()
+        if tracer is not None:
+            tracer.write_gpu_timing_event(
+                {
+                    "ts_unix_ns": time.time_ns(),
+                    "event": "gpu_op_timing",
+                    "op_name": op_name,
+                    "gpu_elapsed_us": elapsed_us,
+                    "device": str(tensor.device),
+                }
+            )
+    except Exception:
+        logger.debug("Failed to write norm GPU timing event.", exc_info=True)
 
 
 def _can_view_as_2d(x: torch.Tensor) -> bool:
@@ -60,13 +83,39 @@ def fused_add_rms_norm(
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm import _custom_ops as ops
-
-    ops.fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        variance_epsilon,
+    vllm_config = get_current_vllm_config()
+    do_gpu_timing = bool(
+        vllm_config is not None
+        and vllm_config.observability_config is not None
+        and vllm_config.observability_config.track_gpu_op_timings
+        and x.is_cuda
+        and torch.cuda.is_available()
     )
+    if do_gpu_timing:
+        stream = torch.cuda.current_stream()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        ops.fused_add_rms_norm(
+            x,
+            residual,
+            weight,
+            variance_epsilon,
+        )
+        end_event.record(stream)
+        end_event.synchronize()
+        _trace_norm_gpu_timing(
+            "add_norm_comp",
+            float(start_event.elapsed_time(end_event) * 1000.0),
+            x,
+        )
+    else:
+        ops.fused_add_rms_norm(
+            x,
+            residual,
+            weight,
+            variance_epsilon,
+        )
     return x, residual
 
 
@@ -260,7 +309,30 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        do_gpu_timing = bool(
+            get_current_vllm_config() is not None
+            and get_current_vllm_config().observability_config is not None
+            and get_current_vllm_config().observability_config.track_gpu_op_timings
+            and x.is_cuda
+            and torch.cuda.is_available()
+        )
         if residual is None and not envs.VLLM_BATCH_INVARIANT:
+            if do_gpu_timing:
+                stream = torch.cuda.current_stream()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record(stream)
+                out = ir.ops.rms_norm(
+                    x, self.weight.data, self.variance_epsilon, self.variance_size_override
+                )
+                end_event.record(stream)
+                end_event.synchronize()
+                _trace_norm_gpu_timing(
+                    "norm_comp",
+                    float(start_event.elapsed_time(end_event) * 1000.0),
+                    x,
+                )
+                return out
             return ir.ops.rms_norm(
                 x, self.weight.data, self.variance_epsilon, self.variance_size_override
             )
