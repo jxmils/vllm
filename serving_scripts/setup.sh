@@ -1,5 +1,6 @@
 module purge
-module load CUDA/12.9.0
+module load Anaconda3/2025.06-1
+module load CUDA/12.1.1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$REPO_ROOT/.venv"
@@ -10,6 +11,24 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
-which python
+PYTHON_PATH="$(command -v python)"
+echo "Using python: $PYTHON_PATH"
 
+EXPECTED_PYTHON="$VENV_DIR/bin/python"
+if [ "$PYTHON_PATH" != "$EXPECTED_PYTHON" ]; then
+  echo "Error: python did not resolve to venv interpreter." >&2
+  echo "Expected: $EXPECTED_PYTHON" >&2
+  echo "Got:      $PYTHON_PATH" >&2
+  exit 1
+fi
 
+python -m pip install -U pip
+python -m pip install -r requirements/cuda.txt
+
+python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 1 \
+  --enforce-eager \
+  --disable-custom-all-reduce

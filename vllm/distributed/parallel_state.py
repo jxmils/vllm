@@ -44,7 +44,6 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -604,7 +603,12 @@ class GroupCoordinator:
         sample_tensor: torch.Tensor,
         fn: Callable[[], torch.Tensor],
     ) -> torch.Tensor:
-        cfg = get_current_vllm_config()
+        try:
+            from vllm.config import get_current_vllm_config
+
+            cfg = get_current_vllm_config()
+        except Exception:
+            cfg = None
         do_timing = bool(
             cfg is not None
             and cfg.observability_config is not None
