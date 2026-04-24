@@ -185,7 +185,7 @@ class ParallelConfig:
     sequentially in multiple batches. To avoid RAM OOM when using tensor
     parallel and large models."""
 
-    disable_custom_all_reduce: bool = False
+    disable_custom_all_reduce: bool = True
     """Disable the custom all-reduce kernel and fall back to NCCL."""
 
     enable_elastic_ep: bool = False
