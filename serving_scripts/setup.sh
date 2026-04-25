@@ -1,6 +1,7 @@
 module purge
 module load Anaconda3/2025.06-1
 module load CUDA/12.9.0
+export REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 VENV_DIR="${REPO_ROOT}/.venv"
 echo "REPO_ROOT=$REPO_ROOT"
@@ -32,6 +33,9 @@ python -m pip install -r "$REPO_ROOT/requirements/build/cuda.txt"
 )
 
 export VLLM_TARGET_DEVICE=cuda
+export VLLM_USE_DEEP_GEMM=0
+export VLLM_MOE_USE_DEEP_GEMM=0
+export VLLM_DEEP_GEMM_WARMUP=skip
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --host 0.0.0.0 \
