@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=vllm-host-qwen3-30b
 #SBATCH --partition=short
-#SBATCH --gres=gpu:h100:8
+#SBATCH --gres=gpu:h100:2
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=256G
 #SBATCH --time=00:10:00
@@ -51,7 +51,7 @@ export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-TP="${TP:-8}"
+TP="${TP:-2}"
 EP="${EP:-1}"
 SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT.sh"
 
