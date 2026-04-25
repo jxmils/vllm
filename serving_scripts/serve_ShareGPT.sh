@@ -13,7 +13,11 @@ module purge
 module load Anaconda3/2025.06-1
 module load CUDA/12.9.0
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -n "${SLURM_SUBMIT_DIR:-}" ]; then
+  REPO_ROOT="${SLURM_SUBMIT_DIR}"
+else
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 VENV_DIR="${REPO_ROOT}/.venv"
 echo "REPO_ROOT=${REPO_ROOT}"
 
