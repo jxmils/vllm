@@ -25,8 +25,10 @@ fi
 python -m pip install -U pip
 python -m pip install -r requirements/cuda.txt
 
+export VLLM_TARGET_DEVICE=cuda
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen2.5-0.5B-Instruct \
+  --device cuda \
   --host 0.0.0.0 \
   --port 8000 \
   --tensor-parallel-size 1 \
