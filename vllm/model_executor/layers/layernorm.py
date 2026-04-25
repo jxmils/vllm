@@ -83,7 +83,10 @@ def fused_add_rms_norm(
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm import _custom_ops as ops
-    vllm_config = get_current_vllm_config()
+    try:
+        vllm_config = get_current_vllm_config()
+    except AssertionError:
+        vllm_config = None
     do_gpu_timing = bool(
         vllm_config is not None
         and vllm_config.observability_config is not None
