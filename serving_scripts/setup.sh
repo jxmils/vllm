@@ -1,6 +1,19 @@
 module purge
 module load Anaconda3/2025.06-1
-module load CUDA/12.1.1
+
+# vLLM’s default prebuilt line is CUDA 12.9 (cu129). ARC provides CUDA/12.9.0.
+# Override if needed: export VLLM_SETUP_CUDA_MODULE=CUDA/13.0.2
+CUDA_MODULE="${VLLM_SETUP_CUDA_MODULE:-CUDA/12.9.0}"
+module load "$CUDA_MODULE"
+echo "Loaded CUDA module: $CUDA_MODULE"
+
+if [ -z "${CUDA_HOME:-}" ] && command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(cd "$(dirname "$(command -v nvcc)")/.." && pwd)"
+  echo "CUDA_HOME was unset; set to: $CUDA_HOME"
+fi
+if command -v nvcc >/dev/null 2>&1; then
+  nvcc --version | head -n 1 || true
+fi
 
 if [ -n "${REPO_ROOT_OVERRIDE:-}" ]; then
   REPO_ROOT="${REPO_ROOT_OVERRIDE}"
@@ -64,10 +77,13 @@ fi
 
 python -m pip install -U pip
 python -m pip install -r "$REPO_ROOT/requirements/cuda.txt"
+# Mirrors pyproject [build-system] requires — needed if you use
+# `pip install -e . --no-build-isolation` (otherwise setuptools_scm etc. are missing).
+python -m pip install -r "$REPO_ROOT/requirements/build/cuda.txt"
 (
   cd "$REPO_ROOT" || exit 1
   export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED:-1}"
-  python -m pip install -e .
+  python -m pip install -e . ${VLLM_PIP_INSTALL_EXTRA_ARGS:-}
 )
 if ! python -c "import vllm._C" 2>/dev/null; then
   echo "Error: vllm._C is missing after install. Precompiled install did not place it." >&2
@@ -76,7 +92,8 @@ if ! python -c "import vllm._C" 2>/dev/null; then
   echo "  cd $REPO_ROOT && python -m pip install -e ." >&2
   echo "Or build from source (no precompiled; needs nvcc/CMake; slow):" >&2
   echo "  export VLLM_USE_PRECOMPILED=0" >&2
-  echo "  cd $REPO_ROOT && python -m pip install -e ." >&2
+  echo "  python -m pip install -r $REPO_ROOT/requirements/build/cuda.txt" >&2
+  echo "  cd $REPO_ROOT && python -m pip install -e . --no-build-isolation" >&2
   exit 1
 fi
 
