@@ -117,12 +117,17 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
     prop.allocFlags.gpuDirectRDMACapable = 1;
   }
   int fab_flag = 0;
+  // Fabric handle attributes exist only in newer CUDA toolkits (not in 12.1
+  // headers). Skip when building against an older cuda.h to avoid hard errors;
+  // allocation still works via the cuMemCreate fallback path below.
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
   CUresult fab_result = cuDeviceGetAttribute(
       &fab_flag, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device);
   if (fab_result == CUDA_SUCCESS &&
       fab_flag) {  // support fabric handle if possible
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   }
+#endif
 #endif
 
 #ifndef USE_ROCM
