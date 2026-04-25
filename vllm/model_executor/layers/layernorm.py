@@ -309,10 +309,14 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        try:
+            vllm_config = get_current_vllm_config()
+        except AssertionError:
+            vllm_config = None
         do_gpu_timing = bool(
-            get_current_vllm_config() is not None
-            and get_current_vllm_config().observability_config is not None
-            and get_current_vllm_config().observability_config.track_gpu_op_timings
+            vllm_config is not None
+            and vllm_config.observability_config is not None
+            and vllm_config.observability_config.track_gpu_op_timings
             and x.is_cuda
             and torch.cuda.is_available()
         )

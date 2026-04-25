@@ -586,7 +586,10 @@ class MoERunner(MoERunnerInterface):
         request_scope: dict[str, int | None],
         rank_info: dict[str, int | None],
     ) -> tuple[tuple[torch.Tensor, torch.Tensor] | torch.Tensor, float | None]:
-        cfg = get_current_vllm_config()
+        try:
+            cfg = get_current_vllm_config()
+        except AssertionError:
+            cfg = None
         enabled = bool(
             cfg is not None
             and cfg.observability_config is not None

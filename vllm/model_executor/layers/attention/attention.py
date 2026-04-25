@@ -768,7 +768,10 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
-    vllm_config = get_current_vllm_config()
+    try:
+        vllm_config = get_current_vllm_config()
+    except AssertionError:
+        vllm_config = None
     do_gpu_timing = bool(
         vllm_config is not None
         and vllm_config.observability_config is not None
