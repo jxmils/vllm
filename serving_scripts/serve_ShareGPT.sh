@@ -38,7 +38,7 @@ fi
 
 python -m pip install -U pip datasets
 
-DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/datasets/sharegpt_sample.json}"
+RAW_DATASET_PATH="${RAW_DATASET_PATH:-${REPO_ROOT}/datasets/sharegpt_sample.json}"
 PROMPTS_OUT="${PROMPTS_OUT:-${REPO_ROOT}/datasets/sharegpt_prompts.jsonl}"
 MAX_ROWS="${MAX_ROWS:-100000}"
 NUM_PROMPTS="${NUM_PROMPTS:-100}"
@@ -50,13 +50,13 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 ENDPOINT="${ENDPOINT:-/v1/chat/completions}"
 
-mkdir -p "$(dirname "${DATASET_PATH}")"
+mkdir -p "$(dirname "${RAW_DATASET_PATH}")"
 mkdir -p "$(dirname "${PROMPTS_OUT}")"
 
 # Use the repository dataset preparation script to keep data formatting consistent.
 python "${REPO_ROOT}/datasets/prepare_sharegpt_vicuna_prompts.py" \
   --max-rows "${MAX_ROWS}" \
-  --raw-out "${DATASET_PATH}" \
+  --raw-out "${RAW_DATASET_PATH}" \
   --prompts-out "${PROMPTS_OUT}"
 
 cd "${REPO_ROOT}"
@@ -67,8 +67,8 @@ vllm bench serve \
   --port "${PORT}" \
   --endpoint "${ENDPOINT}" \
   --model "${MODEL_ID}" \
-  --dataset-name sharegpt \
-  --dataset-path "${DATASET_PATH}" \
+  --dataset-name custom \
+  --dataset-path "${PROMPTS_OUT}" \
   --num-prompts "${NUM_PROMPTS}" \
   --request-rate "${REQUEST_RATE}" \
   --burstiness "${BURSTINESS}" \
