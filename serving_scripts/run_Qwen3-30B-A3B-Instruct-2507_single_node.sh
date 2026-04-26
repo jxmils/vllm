@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=vllm-host-qwen3-30b
 #SBATCH --partition=short
-#SBATCH --gres=gpu:h100:2
+#SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=256G
 #SBATCH --time=01:00:00
@@ -47,7 +47,6 @@ python -m pip install -r "${REPO_ROOT}/requirements/build/cuda.txt"
 )
 
 export VLLM_TARGET_DEVICE=cuda
-# DeepGEMM can fail on some ARC nodes/toolchains; disable by default.
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
 export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
@@ -55,7 +54,7 @@ export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-TP="${TP:-2}"
+TP="${TP:-4}"
 EP="${EP:-1}"
 SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT.sh"
 
