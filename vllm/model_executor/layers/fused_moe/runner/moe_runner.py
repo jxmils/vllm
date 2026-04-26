@@ -478,7 +478,7 @@ class MoERunner(MoERunnerInterface):
                 "ep_rank": self.moe_config.ep_rank,
                 "tp_rank": self.moe_config.tp_rank,
             }
-            topk_weights, topk_ids, gpu_topk_us = self._run_with_cuda_timing(
+            (topk_weights, topk_ids), gpu_topk_us = self._run_with_cuda_timing(
                 "moe_topk",
                 lambda: self.router.select_experts(
                     hidden_states=hidden_states,
