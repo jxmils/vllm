@@ -36,13 +36,11 @@ if [ "${PYTHON_PATH}" != "${EXPECTED_PYTHON}" ]; then
   exit 1
 fi
 
-python -m pip install -U pip datasets
+python -m pip install -U pip
 
-RAW_DATASET_PATH="${RAW_DATASET_PATH:-${REPO_ROOT}/datasets/sharegpt_sample.json}"
-PROMPTS_OUT="${PROMPTS_OUT:-${REPO_ROOT}/datasets/sharegpt_prompts.jsonl}"
-MAX_ROWS="${MAX_ROWS:-100000}"
+DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/datasets/sharegpt_buckets/Qwen_Qwen3-30B-A3B-Instruct-2507/sharegpt_sp128.jsonl}"
 NUM_PROMPTS="${NUM_PROMPTS:-100}"
-REQUEST_RATE="${REQUEST_RATE:-10.0}"
+REQUEST_RATE="${REQUEST_RATE:-1.0}"
 BURSTINESS="${BURSTINESS:-1.0}"
 SEED="${SEED:-100}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
@@ -50,14 +48,11 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 ENDPOINT="${ENDPOINT:-/v1/chat/completions}"
 
-mkdir -p "$(dirname "${RAW_DATASET_PATH}")"
-mkdir -p "$(dirname "${PROMPTS_OUT}")"
-
-# Use the repository dataset preparation script to keep data formatting consistent.
-python "${REPO_ROOT}/datasets/prepare_sharegpt_vicuna_prompts.py" \
-  --max-rows "${MAX_ROWS}" \
-  --raw-out "${RAW_DATASET_PATH}" \
-  --prompts-out "${PROMPTS_OUT}"
+if [ ! -f "${DATASET_PATH}" ]; then
+  echo "Dataset file not found: ${DATASET_PATH}" >&2
+  echo "Generate buckets first with datasets/build_sharegpt_length_buckets.py" >&2
+  exit 1
+fi
 
 cd "${REPO_ROOT}"
 
@@ -68,7 +63,7 @@ vllm bench serve \
   --endpoint "${ENDPOINT}" \
   --model "${MODEL_ID}" \
   --dataset-name custom \
-  --dataset-path "${PROMPTS_OUT}" \
+  --dataset-path "${DATASET_PATH}" \
   --num-prompts "${NUM_PROMPTS}" \
   --request-rate "${REQUEST_RATE}" \
   --burstiness "${BURSTINESS}" \
