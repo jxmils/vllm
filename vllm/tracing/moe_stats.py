@@ -29,7 +29,10 @@ def _now_utc_compact() -> str:
 
 class MoEStatsTracer:
     def __init__(self, base_dir: str | None = None):
-        config = get_current_vllm_config()
+        try:
+            config = get_current_vllm_config()
+        except AssertionError:
+            config = None
         parallel_config = config.parallel_config if config is not None else None
         model_name = (
             config.model_config.model
@@ -222,7 +225,10 @@ def get_moe_stats_tracer() -> MoEStatsTracer | None:
     with _TRACER_LOCK:
         if _TRACER is not None:
             return _TRACER
-        config = get_current_vllm_config()
+        try:
+            config = get_current_vllm_config()
+        except AssertionError:
+            return None
         if (
             config is None
             or config.observability_config is None
