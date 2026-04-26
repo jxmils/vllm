@@ -8,6 +8,7 @@
 #SBATCH --error=results/%x-%j.err
 
 set -euo pipefail
+export GLOO_SOCKET_IFNAME=eth0 # for InfiniBand communication
 
 module purge
 module load Anaconda3/2025.06-1

@@ -2,14 +2,14 @@
 #SBATCH --job-name=vllm-host-qwen3-30b
 #SBATCH --nodes=2
 #SBATCH --partition=short
-#SBATCH --gres=gpu:h100:4
+#SBATCH --gres=gpu:h100:2
 #SBATCH --mem=512G
 #SBATCH --time=01:00:00
 #SBATCH --output=results/%x-%j.out
 #SBATCH --error=results/%x-%j.err
 
 set -euo pipefail
-
+export GLOO_SOCKET_IFNAME=eth0 # for InfiniBand communication
 export HEAD_NODE=$(scontrol show hostnames $SLURM_NODELIST | head -n1)
 export WORKER_NODES=$(scontrol show hostnames $SLURM_NODELIST | tail -n+2)
 export HEAD_NODE_IP=$(dig +short ${HEAD_NODE})
@@ -64,7 +64,7 @@ TP="${TP:-4}"
 EP="${EP:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-72}"
-SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT.sh"
+SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT_multi_node.sh"
 
 SERVER_STEP_PID=""
 HEAD_RAY_PID=""
