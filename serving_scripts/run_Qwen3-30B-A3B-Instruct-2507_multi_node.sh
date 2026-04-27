@@ -63,7 +63,7 @@ PORT="${PORT:-8000}"
 TP="${TP:-4}"
 EP="${EP:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
-CPUS_PER_TASK="${CPUS_PER_TASK:-72}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-1}}"
 SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT_multi_node.sh"
 
 SERVER_STEP_PID=""
@@ -126,7 +126,8 @@ srun \
   --ntasks=1 \
   --ntasks-per-node=1 \
   --gpus-per-task="${GPUS_PER_NODE}" \
-  ray status
+  --cpus-per-task="${CPUS_PER_TASK}" \
+  bash -lc "source \"${VENV_DIR}/bin/activate\" && ray status"
 
 echo "Starting vLLM server on head node..."
 srun \
