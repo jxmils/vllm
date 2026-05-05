@@ -9,12 +9,69 @@
 #SBATCH --error=results/%x-%j.err
 
 set -euo pipefail
+
+# Set DEBUG_SLURM_SCRIPT=1 for extra diagnostics (DNS probes, PATH, ray location).
+DEBUG_SLURM_SCRIPT="${DEBUG_SLURM_SCRIPT:-0}"
+slurm_debug() {
+  if [ "${DEBUG_SLURM_SCRIPT}" = "1" ]; then
+    echo "[slurm-debug] $*" >&2
+  fi
+}
+
 export GLOO_SOCKET_IFNAME=eth0 # for InfiniBand communication
 export HEAD_NODE=$(scontrol show hostnames $SLURM_NODELIST | head -n1)
 export WORKER_NODES=$(scontrol show hostnames $SLURM_NODELIST | tail -n+2)
-export HEAD_NODE_IP=$(dig +short ${HEAD_NODE})
+
+echo "=== vLLM multi-node host job ==="
+echo "Date: $(date -Is 2>/dev/null || date)"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
+echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
+echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-}"
+echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-}"
+echo "HEAD_NODE=${HEAD_NODE}"
+echo "WORKER_NODES=${WORKER_NODES}"
+slurm_debug "SLURM_NTASKS=${SLURM_NTASKS:-} SLURM_JOB_NUM_NODES=${SLURM_JOB_NUM_NODES:-}"
+slurm_debug "Full nodelist: $(scontrol show hostnames "${SLURM_NODELIST}" 2>/dev/null | tr '\n' ' ')"
+
+# ARC/some clusters do not resolve Slurm hostnames via `dig`; fall back to libc / on-node IP.
+resolve_host_ip() {
+  local nodename="$1"
+  local ip=""
+  local method=""
+  ip=$(dig +short "${nodename}" 2>/dev/null | head -n1)
+  if [ -n "${ip}" ]; then
+    method="dig"
+  fi
+  if [ -z "${ip}" ]; then
+    ip=$(getent hosts "${nodename}" 2>/dev/null | awk 'NR==1 {print $1}')
+    [ -n "${ip}" ] && method="getent"
+  fi
+  if [ -z "${ip}" ] && command -v python3 >/dev/null 2>&1; then
+    ip=$(python3 -c "import socket; print(socket.gethostbyname(\"${nodename}\"))" 2>/dev/null || true)
+    [ -n "${ip}" ] && method="python_socket"
+  fi
+  if [ -z "${ip}" ]; then
+    ip=$(
+      srun --nodelist="${nodename}" --nodes=1 --ntasks=1 \
+        --cpus-per-task="${SLURM_CPUS_PER_TASK:-1}" \
+        bash -c "hostname -I 2>/dev/null | awk '{print \$1}'" 2>/dev/null || true
+    )
+    [ -n "${ip}" ] && method="srun_hostname_I"
+  fi
+  slurm_debug "resolve_host_ip(${nodename}) -> ${ip:-<empty>} [${method:-failed}]"
+  printf '%s' "${ip}"
+}
+
+export HEAD_NODE_IP="$(resolve_host_ip "${HEAD_NODE}")"
+if [ -z "${HEAD_NODE_IP}" ]; then
+  echo "Error: could not resolve IP for head node ${HEAD_NODE} (dig/getent/python/srun all failed)." >&2
+  exit 1
+fi
+echo "HEAD_NODE_IP=${HEAD_NODE_IP}"
+
 export RAY_PORT=6378
 export RAY_ADDRESS=$HEAD_NODE_IP:$RAY_PORT
+echo "RAY_PORT=${RAY_PORT} RAY_ADDRESS=${RAY_ADDRESS}"
 
 module purge
 module load Anaconda3/2025.06-1
@@ -27,6 +84,7 @@ else
 fi
 VENV_DIR="${REPO_ROOT}/.venv"
 echo "REPO_ROOT=${REPO_ROOT}"
+echo "VENV_DIR=${VENV_DIR}"
 
 if [ ! -d "${VENV_DIR}" ]; then
   python3 -m venv "${VENV_DIR}"
@@ -42,6 +100,10 @@ if [ "${PYTHON_PATH}" != "${EXPECTED_PYTHON}" ]; then
   echo "Got:      ${PYTHON_PATH}" >&2
   exit 1
 fi
+
+echo "After venv: python=$(command -v python) ray=$(command -v ray 2>/dev/null || echo '<not on PATH>')"
+slurm_debug "PATH=${PATH}"
+slurm_debug "pip install starting (cuda + build + editable vllm)..."
 
 python -m pip install -U pip
 python -m pip install -r "${REPO_ROOT}/requirements/cuda.txt"
@@ -66,6 +128,13 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-2}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-${SLURM_CPUS_PER_TASK:-1}}"
 SERVE_SCRIPT="${REPO_ROOT}/serving_scripts/serve_ShareGPT_multi_node.sh"
 
+echo "=== runtime knobs ==="
+echo "MODEL_ID=${MODEL_ID} HOST=${HOST} PORT=${PORT} TP=${TP} EP=${EP}"
+echo "GPUS_PER_NODE=${GPUS_PER_NODE} CPUS_PER_TASK=${CPUS_PER_TASK}"
+echo "SERVE_SCRIPT=${SERVE_SCRIPT}"
+echo "HF_TOKEN is ${HF_TOKEN:+set}${HF_TOKEN:-not set}"
+slurm_debug "VLLM_TARGET_DEVICE=${VLLM_TARGET_DEVICE} VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}"
+
 SERVER_STEP_PID=""
 HEAD_RAY_PID=""
 WORKER_RAY_PIDS=""
@@ -88,7 +157,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting head node ${HEAD_NODE}..."
+echo "=== Ray head (background srun) ==="
+echo "Starting head node ${HEAD_NODE} (HEAD_RAY_PID will be set)..."
 srun \
   --nodelist "${HEAD_NODE}" \
   --nodes=1 \
@@ -96,14 +166,20 @@ srun \
   --ntasks-per-node=1 \
   --gpus-per-task="${GPUS_PER_NODE}" \
   --cpus-per-task="${CPUS_PER_TASK}" \
-  bash -lc "export VLLM_HOST_IP=${HEAD_NODE_IP}; ray start --block --head --node-ip-address=${HEAD_NODE_IP} --port=${RAY_PORT}" &
+  bash -lc "source \"${VENV_DIR}/bin/activate\" && export VLLM_HOST_IP=${HEAD_NODE_IP} && ray start --block --head --node-ip-address=${HEAD_NODE_IP} --port=${RAY_PORT}" &
 HEAD_RAY_PID=$!
+echo "HEAD_RAY_PID=${HEAD_RAY_PID}"
 sleep 20
 
 if [ -n "${WORKER_NODES}" ]; then
+  echo "=== Ray workers ==="
   echo "Starting worker nodes..."
   for WORKER in ${WORKER_NODES}; do
-    WORKER_IP=$(dig +short "${WORKER}" | head -n1)
+    WORKER_IP="$(resolve_host_ip "${WORKER}")"
+    if [ -z "${WORKER_IP}" ]; then
+      echo "Error: could not resolve IP for worker ${WORKER}." >&2
+      exit 1
+    fi
     echo "Starting worker node: ${WORKER} with IP ${WORKER_IP}"
     srun \
       --nodelist "${WORKER}" \
@@ -112,12 +188,14 @@ if [ -n "${WORKER_NODES}" ]; then
       --ntasks-per-node=1 \
       --gpus-per-task="${GPUS_PER_NODE}" \
       --cpus-per-task="${CPUS_PER_TASK}" \
-      bash -lc "export VLLM_HOST_IP=${WORKER_IP}; ray start --block --address=${HEAD_NODE_IP}:${RAY_PORT} --node-ip-address=${WORKER_IP}" &
+      bash -lc "source \"${VENV_DIR}/bin/activate\" && export VLLM_HOST_IP=${WORKER_IP} && ray start --block --address=${HEAD_NODE_IP}:${RAY_PORT} --node-ip-address=${WORKER_IP}" &
     WORKER_RAY_PIDS="${WORKER_RAY_PIDS} $!"
+    echo "Worker Ray step pid: $! (WORKER_RAY_PIDS=${WORKER_RAY_PIDS})"
   done
   sleep 20
 fi
 
+echo "=== ray status ==="
 echo "Checking cluster status..."
 srun \
   --overlap \
@@ -129,6 +207,7 @@ srun \
   --cpus-per-task="${CPUS_PER_TASK}" \
   bash -lc "source \"${VENV_DIR}/bin/activate\" && ray status"
 
+echo "=== vLLM api_server (background srun) ==="
 echo "Starting vLLM server on head node..."
 srun \
   --overlap \
@@ -151,14 +230,21 @@ srun \
 SERVER_STEP_PID=$!
 echo "Started vLLM server step (pid=${SERVER_STEP_PID}). Waiting for /health ..."
 
+_health_wait_n=0
 until curl -fsS "http://${HEAD_NODE_IP}:${PORT}/health" >/dev/null 2>&1; do
   if ! kill -0 "${SERVER_STEP_PID}" 2>/dev/null; then
     echo "Server process exited before becoming ready." >&2
     wait "${SERVER_STEP_PID}" || true
     exit 1
   fi
+  _health_wait_n=$((_health_wait_n + 1))
+  # Every ~60s by default; every loop if DEBUG_SLURM_SCRIPT=1
+  if [ "${DEBUG_SLURM_SCRIPT}" = "1" ] || [ "$((_health_wait_n % 12))" -eq 0 ]; then
+    echo "Still waiting for http://${HEAD_NODE_IP}:${PORT}/health (attempt ${_health_wait_n}) ..."
+  fi
   sleep 5
 done
+unset _health_wait_n
 echo "Server is healthy. Running ${SERVE_SCRIPT} ..."
 
 HOST="${HEAD_NODE_IP}" PORT="${PORT}" MODEL_ID="${MODEL_ID}" \
