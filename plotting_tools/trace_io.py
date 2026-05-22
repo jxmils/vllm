@@ -100,9 +100,9 @@ def tag_phase(
     phase_ranges: list[tuple[str, int, int]] = []
     for r in nvtx:
         n = r["name"].lower()
-        if "prefill" in n or "prompt" in n or "context" in n:
+        if n in ("prefill", "mixed") or "prefill" in n or "prompt" in n or "context" in n:
             phase_ranges.append(("prefill", r["ts"], r["end"]))
-        elif "decode" in n or "generation" in n or "token" in n:
+        elif n == "decode" or "decode" in n or "generation" in n:
             phase_ranges.append(("decode", r["ts"], r["end"]))
 
     for e in events:

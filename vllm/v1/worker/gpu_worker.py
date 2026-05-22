@@ -54,7 +54,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    compute_iteration_details,
+    iteration_nvtx_range,
+    report_usage_stats,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -809,7 +813,9 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        with iteration_nvtx_range(scheduler_output), self.annotate_profile(
+            scheduler_output
+        ):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )

@@ -501,3 +501,50 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_generation_requests,
         num_generation_tokens,
     )
+
+
+def iteration_phase_nvtx_label(details: IterationDetails) -> str:
+    """Label for per-iteration NVTX range (visible in Nsight NVTX_EVENTS)."""
+    ctx = details.num_ctx_tokens
+    gen = details.num_generation_tokens
+    if ctx > 0 and gen == 0:
+        return "prefill"
+    if gen > 0 and ctx == 0:
+        return "decode"
+    if ctx > 0 and gen > 0:
+        return "mixed"
+    return "idle"
+
+
+@contextlib.contextmanager
+def iteration_nvtx_range(scheduler_output: SchedulerOutput):
+    """
+    Wrap GPU model execution in NVTX ranges for prefill vs decode.
+
+    Enable on workers: ``export VLLM_ITERATION_NVTX=1`` and include ``nvtx`` in
+    ``NSYS_TRACE`` (e.g. ``cuda,nvtx,osrt,cudnn,cublas``).
+
+    Uses ``nvtx.nvtx_range`` when the ``nvtx`` package is installed, otherwise
+    ``torch.cuda.nvtx`` push/pop (same markers in Nsight).
+    """
+    if not envs.VLLM_ITERATION_NVTX:
+        yield
+        return
+    if scheduler_output.total_num_scheduled_tokens <= 0:
+        yield
+        return
+
+    label = iteration_phase_nvtx_label(compute_iteration_details(scheduler_output))
+    try:
+        from nvtx import nvtx_range
+
+        with nvtx_range(label):
+            yield
+    except ImportError:
+        import torch.cuda.nvtx as cuda_nvtx
+
+        cuda_nvtx.range_push(label)
+        try:
+            yield
+        finally:
+            cuda_nvtx.range_pop()
