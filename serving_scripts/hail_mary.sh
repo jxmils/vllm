@@ -623,6 +623,8 @@ export NSYS_ENABLE="${NSYS_ENABLE:-1}"
 export NSYS_DIR="${TRACE_RUN_DIR}/nsight"
 export NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,cudnn,cublas}"
 export NSYS_DELAY="${NSYS_DELAY:-0}"
+# Per-iteration NVTX ranges (prefill / decode / mixed) on Ray GPU workers.
+export VLLM_ITERATION_NVTX="${VLLM_ITERATION_NVTX:-1}"
 
 # === NCCL logs ===
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
@@ -632,6 +634,7 @@ echo "TRACE_RUN_DIR=${TRACE_RUN_DIR}"
 echo "NSYS_DIR=${NSYS_DIR}"
 echo "NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
 echo "NSYS_TRACE=${NSYS_TRACE}"
+echo "VLLM_ITERATION_NVTX=${VLLM_ITERATION_NVTX}"
 echo "NSYS_DELAY=${NSYS_DELAY}"
 echo "NSYS_ENABLE=${NSYS_ENABLE}"
 echo "NSYS_PROFILE_WORKERS=${NSYS_PROFILE_WORKERS}"
