@@ -85,15 +85,19 @@ def comm_op_for_parsed_event(
 ) -> str | None:
     """Same rules as plots._classify_event_for_comm_breakdown (no event dict)."""
     if kind == "control":
-        return None
+        return classify_comm_operation(name, cat, args=args)
     if kind == "comm":
         return classify_comm_operation(name, cat, args=args)
-    if kind == "compute":
-        op = classify_comm_operation(name, "kernel", args=args)
-        if op is None or (op and op.startswith("memcpy")):
-            return None
-        return op
     return None
+
+
+def _comm_op_counts_from_labels(labels: Counter) -> dict[str, int]:
+    """Derive op totals from comm_op_labels (single source of truth)."""
+    out: Counter = Counter()
+    for key, n in labels.items():
+        op = key.split("|", 1)[0]
+        out[op] += int(n)
+    return dict(sorted(out.items(), key=lambda x: (-x[1], x[0])))
 
 
 @dataclass
@@ -111,8 +115,6 @@ class ClassificationReport:
     classified_labels: Counter = field(default_factory=Counter)
     ambiguous_control: Counter = field(default_factory=Counter)
     other_compute_kernels: Counter = field(default_factory=Counter)
-    # Comm op buckets (all_reduce, memcpy_htod, …)
-    comm_op_counts: Counter = field(default_factory=Counter)
     comm_op_labels: Counter = field(default_factory=Counter)
     unclassified_comm_labels: Counter = field(default_factory=Counter)
     # Events not bucketed by comm breakdown (control, most compute, etc.)
@@ -151,11 +153,9 @@ class ClassificationReport:
                 _full_label_key(kind, sub, cat, name)
             ] += 1
         elif op == "unclassified_comm":
-            self.comm_op_counts[op] += 1
             self.unclassified_comm_labels[_label_key(name, cat)] += 1
             self.comm_op_labels[f"{op}|{_label_key(name, cat)}"] += 1
         else:
-            self.comm_op_counts[op] += 1
             self.comm_op_labels[f"{op}|{_label_key(name, cat)}"] += 1
 
     def record_comm_breakdown(
@@ -163,9 +163,8 @@ class ClassificationReport:
         stats: dict[str, dict[str, float | int]],
         unclassified: Counter | dict[str, int],
     ) -> None:
-        """Merge post-hoc comm breakdown (should match record_parsed_event comm ops)."""
-        for op, s in stats.items():
-            self.comm_op_counts[op] += int(s.get("count", 0))
+        """Merge unclassified comm labels from plot breakdown (counts not duplicated)."""
+        _ = stats
         if isinstance(unclassified, Counter):
             self.unclassified_comm_labels.update(unclassified)
         else:
@@ -176,8 +175,12 @@ class ClassificationReport:
         return {
             "classified_by_kind_sub_name": _nested_by_kind_sub(self.classified_labels),
             "classified_labels_flat": _sorted_counter_dict(self.classified_labels),
-            "comm_op_counts": _sorted_counter_dict(self.comm_op_counts),
+            "comm_op_counts": _comm_op_counts_from_labels(self.comm_op_labels),
             "comm_op_labels": _sorted_counter_dict(self.comm_op_labels),
+            "comm_op_counts_note": (
+                "Derived from comm_op_labels (one count per event); "
+                "do not add record_comm_breakdown stats."
+            ),
             "unclassified_comm_labels": _sorted_counter_dict(self.unclassified_comm_labels),
             "excluded_from_comm_breakdown": _sorted_counter_dict(
                 self.excluded_from_comm_breakdown
@@ -215,7 +218,6 @@ class ClassificationReport:
         self.classified_labels.update(other.classified_labels)
         self.ambiguous_control.update(other.ambiguous_control)
         self.other_compute_kernels.update(other.other_compute_kernels)
-        self.comm_op_counts.update(other.comm_op_counts)
         self.comm_op_labels.update(other.comm_op_labels)
         self.unclassified_comm_labels.update(other.unclassified_comm_labels)
         self.excluded_from_comm_breakdown.update(other.excluded_from_comm_breakdown)
@@ -255,9 +257,13 @@ def format_plotting_log(
     per_trace: list[ClassificationReport],
     *,
     parallel_label: str,
-    merged_comm: dict[str, dict[str, float | int]] | None = None,
+    merged_fabric_comm: dict[str, dict[str, float | int]] | None = None,
+    merged_data_movement: dict[str, dict[str, float | int]] | None = None,
     job_inventory: dict[str, Any] | None = None,
+    merged_comm: dict[str, dict[str, float | int]] | None = None,
 ) -> str:
+    if merged_fabric_comm is None:
+        merged_fabric_comm = merged_comm
     lines: list[str] = [
         "vLLM plotting / classification log",
         "=" * 72,
@@ -307,8 +313,16 @@ def format_plotting_log(
         "JOB — classified_labels (all kinds) top:",
     ])
     _format_counter_section(lines, "", job_merged.classified_labels, top_n=_TXT_TOP_N)
-    lines.extend(["", "JOB — comm_op_counts:"])
-    _format_counter_section(lines, "", job_merged.comm_op_counts, top_n=_TXT_TOP_N)
+    lines.extend([
+        "",
+        "JOB — comm_op_counts (derived from comm_op_labels):",
+    ])
+    _format_counter_section(
+        lines,
+        "",
+        Counter(_comm_op_counts_from_labels(job_merged.comm_op_labels)),
+        top_n=_TXT_TOP_N,
+    )
     lines.extend(["", "JOB — comm_op_labels (op|cat|name) top:"])
     _format_counter_section(lines, "", job_merged.comm_op_labels, top_n=_TXT_TOP_N)
     if job_merged.unclassified_comm_labels:
@@ -334,10 +348,14 @@ def format_plotting_log(
     )
     lines.extend(["", "COMPATIBILITY", compat, ""])
 
-    if merged_comm:
-        lines.extend(["", "COLLECTIVE OPS BREAKDOWN (dur_us from plots)"])
+    def _append_breakdown_section(
+        heading: str, merged: dict[str, dict[str, float | int]] | None
+    ) -> None:
+        if not merged:
+            return
+        lines.extend(["", heading])
         for op, stats in sorted(
-            merged_comm.items(),
+            merged.items(),
             key=lambda x: float(x[1].get("dur_us", 0)),
             reverse=True,
         ):
@@ -346,6 +364,15 @@ def format_plotting_log(
                 f"  {op}: count={stats.get('count', 0)} "
                 f"dur_ms={dur_ms:.2f} bytes={stats.get('bytes', 0)}"
             )
+
+    _append_breakdown_section(
+        "FABRIC COMM BREAKDOWN (network_collective / network_p2p; dur_us from plots)",
+        merged_fabric_comm,
+    )
+    _append_breakdown_section(
+        "DATA MOVEMENT BREAKDOWN (device_copy, host_transfer; not fabric)",
+        merged_data_movement,
+    )
 
     if job_inventory:
         n_flat = len(job_inventory.get("classified_labels_flat") or {})
@@ -374,7 +401,7 @@ def _compatibility_note(
         if comm > 0:
             notes.append(
                 f"  OK: {comm:,} comm events — compatible for TP={tp} "
-                "(verify all_reduce in collective_ops_breakdown)."
+                "(verify all_reduce in fabric_comm_breakdown)."
             )
     if sum(amb.values()) > comm * 0.05 and comm > 0:
         notes.append(
@@ -395,9 +422,13 @@ def write_plotting_log(
     reports: list[ClassificationReport],
     job_meta: dict[str, Any],
     *,
-    merged_comm: dict[str, dict[str, float | int]] | None = None,
+    merged_fabric_comm: dict[str, dict[str, float | int]] | None = None,
+    merged_data_movement: dict[str, dict[str, float | int]] | None = None,
     job_inventory: dict[str, Any] | None = None,
+    merged_comm: dict[str, dict[str, float | int]] | None = None,
 ) -> None:
+    if merged_fabric_comm is None:
+        merged_fabric_comm = merged_comm
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "plotting_log.txt").write_text(text)
     payload: dict[str, Any] = {
@@ -405,6 +436,9 @@ def write_plotting_log(
         "job_inventory": job_inventory or merge_reports(reports).inventory_dict(),
         "traces": [r.to_dict() for r in reports],
     }
-    if merged_comm is not None:
-        payload["merged_comm_ops"] = merged_comm
+    if merged_fabric_comm is not None:
+        payload["merged_fabric_comm_ops"] = merged_fabric_comm
+        payload["merged_comm_ops"] = merged_fabric_comm
+    if merged_data_movement is not None:
+        payload["merged_data_movement_ops"] = merged_data_movement
     (out_dir / "plotting_log.json").write_text(json.dumps(payload, indent=2))
