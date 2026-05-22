@@ -242,7 +242,7 @@ def adjust_duty_with_pp_balance(
     supplement = max(0.0, pp_reference_us_per_rank - local_pp)
     if supplement <= 0:
         return duty
-    totals["collective_comm"] = totals.get("collective_comm", 0) + int(supplement)
+    totals["network_p2p"] = totals.get("network_p2p", 0) + int(supplement)
     return {k: v / span for k, v in totals.items()}
 
 

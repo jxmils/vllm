@@ -6,14 +6,22 @@ import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Patch
 
-from plotting_tools.classify import classify_comm_operation, comm_operation_label
+from plotting_tools.classify import (
+    FABRIC_COMM_OPS,
+    MOVEMENT_OPS,
+    classify_comm_operation,
+    comm_operation_label,
+    is_fabric_comm_op,
+    is_fabric_event,
+    is_movement_op,
+)
 from plotting_tools.trace_io import duty_by_sub, merge_intervals
 
 PLOT_EXT = ".pdf"
@@ -46,23 +54,48 @@ TRAFFIC_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
 DECOMPOSED_LAYERS = (
     ("attention_comp", "Attention Comp", "#4c78a8"),
     ("gate_comp", "Gate Comp", "#f58518"),
-    ("experts_comp", "Experts Comp", "#54a24b"),
+    ("moe_expert", "MoE Expert Comp", "#54a24b"),
+    ("moe_routing", "MoE Routing Comp", "#2ca02c"),
+    ("matmul_gemm", "Matmul/GEMM Comp", "#17becf"),
+    ("kv_cache_write", "KV Cache Write", "#6baed6"),
+    ("rotary_embedding", "Rotary Embedding", "#bcbddc"),
     ("add_norm_comp", "Add and Norm Comp", "#b279a2"),
+    ("sampling_overhead", "Sampling Overhead", "#fdb462"),
+    ("masking_indexing", "Masking / Indexing", "#8c6d31"),
     ("other_compute", "Other Compute", "#9ecae9"),
-    ("collective_comm", "Collective Comm", "#e45756"),
+    ("network_collective", "Network Collective", "#e45756"),
+    ("network_p2p", "Network P2P", "#d62728"),
+    ("device_copy", "Device Memcpy", "#ff9896"),
+    ("host_transfer", "Host Memcpy", "#c5b0d5"),
     ("control", "Control", "#bab0ac"),
 )
 
 DECOMPOSED_LAYERS_PP_SPLIT = (
     ("attention_comp", "Attention Comp", "#4c78a8"),
     ("gate_comp", "Gate Comp", "#f58518"),
-    ("experts_comp", "Experts Comp", "#54a24b"),
+    ("moe_expert", "MoE Expert Comp", "#54a24b"),
+    ("moe_routing", "MoE Routing Comp", "#2ca02c"),
+    ("matmul_gemm", "Matmul/GEMM Comp", "#17becf"),
+    ("kv_cache_write", "KV Cache Write", "#6baed6"),
+    ("rotary_embedding", "Rotary Embedding", "#bcbddc"),
     ("add_norm_comp", "Add and Norm Comp", "#b279a2"),
+    ("sampling_overhead", "Sampling Overhead", "#fdb462"),
+    ("masking_indexing", "Masking / Indexing", "#8c6d31"),
     ("other_compute", "Other Compute", "#9ecae9"),
     ("pp_comm", "PP Comm (SendRecv)", "#d62728"),
-    ("local_comm", "Local Comm (memcpy)", "#ff9896"),
+    ("network_collective", "TP Collective", "#e45756"),
+    ("device_copy", "Device Memcpy", "#ff9896"),
+    ("host_transfer", "Host Memcpy", "#c5b0d5"),
     ("control", "Control", "#bab0ac"),
 )
+
+_COMM_SUBS = frozenset({
+    "network_collective",
+    "network_p2p",
+    "device_copy",
+    "host_transfer",
+    "collective_comm",
+})
 
 SUBCATEGORY_LABELS = {k: label for k, label, _ in DECOMPOSED_LAYERS}
 SUBCATEGORY_LABELS.update(
@@ -95,14 +128,28 @@ def _timeline_interval_ms(
 
 def _decomposed_plot_sub(e: dict[str, Any], *, pp_comm_split: bool) -> str | None:
     sub = e.get("sub")
+    if sub == "experts_comp":
+        sub = "moe_expert"
+    elif sub == "collective_comm":
+        sub = "network_collective"
     if not pp_comm_split:
         return sub
-    if sub != "collective_comm":
+    if sub not in _COMM_SUBS:
         return sub
-    op = classify_comm_operation(e.get("name", ""), e.get("cat", ""))
+    if sub == "network_p2p":
+        return "pp_comm"
+    if sub in ("device_copy", "host_transfer"):
+        return "local_comm"
+    op = classify_comm_operation(
+        e.get("name", ""),
+        e.get("cat", ""),
+        args=e.get("args"),
+    )
     if op == "point_to_point":
         return "pp_comm"
-    return "local_comm"
+    if op in ("device_copy", "host_transfer"):
+        return "local_comm"
+    return sub if sub != "collective_comm" else "network_collective"
 
 
 def _decomposed_layers(pp_comm_split: bool) -> tuple[tuple[str, str, str], ...]:
@@ -486,7 +533,8 @@ def comm_message_stats(
     comms = [
         e
         for e in events
-        if e["kind"] == "comm" and (phase is None or e.get("phase", "unknown") == phase)
+        if is_fabric_event(e)
+        and (phase is None or e.get("phase", "unknown") == phase)
     ]
     sizes: list[int] = []
     for e in comms:
@@ -653,13 +701,8 @@ def _infer_traffic_peers(
 
 
 def _is_traffic_comm_event(e: dict[str, Any]) -> bool:
-    kind = e.get("kind")
-    if kind == "comm":
-        return True
-    if kind == "compute":
-        op = classify_comm_operation(e.get("name", ""), "kernel")
-        return op is not None and not str(op).startswith("memcpy")
-    return False
+    """Fabric / network traffic only (see classify.is_fabric_event)."""
+    return is_fabric_event(e)
 
 
 def build_traffic_matrix(
@@ -928,22 +971,21 @@ def plot_expert_traffic_volume(
 def _classify_event_for_comm_breakdown(
     e: dict[str, Any],
 ) -> str | None:
-    kind = e.get("kind")
-    if kind == "control":
-        return None
+    sub = e.get("sub")
+    if sub in MOVEMENT_OPS:
+        return sub
 
+    kind = e.get("kind")
     name = e.get("name", "")
     cat = e.get("cat", "")
     args = e.get("args") or {}
 
+    if kind == "control":
+        op = classify_comm_operation(name, cat, args=args)
+        return op if op in MOVEMENT_OPS else None
+
     if kind == "comm":
         return classify_comm_operation(name, cat, args=args)
-
-    if kind == "compute":
-        op = classify_comm_operation(name, "kernel", args=args)
-        if op is None or op.startswith("memcpy"):
-            return None
-        return op
 
     return None
 
@@ -955,24 +997,55 @@ def _short_comm_label(name: str, cat: str, width: int = 96) -> str:
     return label[: width - 1] + "…"
 
 
+CommBreakdownScope = Literal["fabric", "movement", "all"]
+
+
 def comm_operation_breakdown(
     events: list[dict[str, Any]],
+    *,
+    scope: CommBreakdownScope = "all",
 ) -> tuple[dict[str, dict[str, float | int]], Counter[str]]:
     """
-    Count duration/bytes per collective op type.
+    Count duration/bytes per comm op bucket.
 
-    Includes CUPTI comm rows and collective GPU kernels (e.g. custom all-reduce).
+    scope:
+      fabric   — is_fabric_event + op in FABRIC_COMM_OPS
+      movement — device_copy (local) + host_transfer (not network)
+      all      — full inventory
     """
     stats: dict[str, dict[str, float | int]] = defaultdict(
         lambda: {"count": 0, "dur_us": 0, "bytes": 0}
     )
     unclassified: Counter[str] = Counter()
     for e in events:
-        op = _classify_event_for_comm_breakdown(e)
-        if op is None:
-            continue
-        if op == "unclassified_comm":
-            unclassified[_short_comm_label(e.get("name", ""), e.get("cat", ""))] += 1
+        if scope == "fabric":
+            if not is_fabric_event(e):
+                continue
+            op = classify_comm_operation(
+                e.get("name", ""),
+                e.get("cat", ""),
+                args=e.get("args"),
+            )
+            if not is_fabric_comm_op(op):
+                if op in ("unclassified_comm", "nccl_other"):
+                    unclassified[
+                        _short_comm_label(e.get("name", ""), e.get("cat", ""))
+                    ] += 1
+                continue
+        elif scope == "movement":
+            if is_fabric_event(e):
+                continue
+            op = _classify_event_for_comm_breakdown(e)
+            if op is None or not is_movement_op(op):
+                continue
+        else:
+            op = _classify_event_for_comm_breakdown(e)
+            if op is None:
+                continue
+            if op == "unclassified_comm":
+                unclassified[
+                    _short_comm_label(e.get("name", ""), e.get("cat", ""))
+                ] += 1
         stats[op]["count"] += 1
         stats[op]["dur_us"] += e["dur"]
         b = _extract_comm_bytes(e)
@@ -981,16 +1054,56 @@ def comm_operation_breakdown(
     return dict(stats), unclassified
 
 
+def merge_comm_operation_breakdowns(
+    breakdowns: list[dict[str, dict[str, float | int]]],
+    *,
+    include_ops: frozenset[str] | None = None,
+) -> dict[str, dict[str, float | int]]:
+    merged: dict[str, dict[str, float | int]] = defaultdict(
+        lambda: {"count": 0, "dur_us": 0, "bytes": 0}
+    )
+    for stats in breakdowns:
+        for op, vals in stats.items():
+            if include_ops is not None and op not in include_ops:
+                continue
+            merged[op]["count"] += vals.get("count", 0)
+            merged[op]["dur_us"] += vals.get("dur_us", 0)
+            merged[op]["bytes"] += vals.get("bytes", 0)
+    return dict(merged)
+
+
+def plot_fabric_comm_breakdown(
+    events: list[dict[str, Any]],
+    out_path: Path,
+    *,
+    title: str,
+) -> tuple[dict[str, dict[str, float | int]], Counter[str]]:
+    """Bar chart: fabric NCCL/custom-AR ops only (excludes device_copy, host_transfer)."""
+    stats, unclassified = comm_operation_breakdown(events, scope="fabric")
+    plot_comm_breakdown_stats(stats, out_path, title=title)
+    return stats, unclassified
+
+
+def plot_data_movement_breakdown(
+    events: list[dict[str, Any]],
+    out_path: Path,
+    *,
+    title: str,
+) -> tuple[dict[str, dict[str, float | int]], Counter[str]]:
+    """Bar chart: local device memcpy + host transfer (not fabric)."""
+    stats, unclassified = comm_operation_breakdown(events, scope="movement")
+    plot_comm_breakdown_stats(stats, out_path, title=title)
+    return stats, unclassified
+
+
 def plot_collective_ops_breakdown(
     events: list[dict[str, Any]],
     out_path: Path,
     *,
     title: str,
 ) -> tuple[dict[str, dict[str, float | int]], Counter[str]]:
-    """Bar chart: comm op type vs event count and vs total time (ms)."""
-    stats, unclassified = comm_operation_breakdown(events)
-    plot_collective_ops_breakdown_stats(stats, out_path, title=title)
-    return stats, unclassified
+    """Backward-compatible alias: fabric-only breakdown."""
+    return plot_fabric_comm_breakdown(events, out_path, title=title)
 
 
 def collect_nccl_ops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1049,7 +1162,7 @@ def plot_window_cdf(
 
 
 def nocomm_windows(events: list[dict[str, Any]]) -> list[float]:
-    comms = [(e["ts"], e["end"]) for e in events if e["kind"] == "comm"]
+    comms = [(e["ts"], e["end"]) for e in events if is_fabric_event(e)]
     if not comms:
         return []
     comms = merge_intervals(comms)
@@ -1068,33 +1181,22 @@ def nocomm_windows(events: list[dict[str, Any]]) -> list[float]:
 
 
 def comm_delta(events: list[dict[str, Any]]) -> list[float]:
-    comms = sorted([e for e in events if e["kind"] == "comm"], key=lambda e: e["ts"])
+    comms = sorted(
+        [e for e in events if is_fabric_event(e)],
+        key=lambda e: e["ts"],
+    )
     if len(comms) < 2:
         return []
     return [(comms[i + 1]["ts"] - comms[i]["ts"]) / 1000.0 for i in range(len(comms) - 1)]
 
 
-def merge_comm_operation_breakdowns(
-    breakdowns: list[dict[str, dict[str, float | int]]],
-) -> dict[str, dict[str, float | int]]:
-    merged: dict[str, dict[str, float | int]] = defaultdict(
-        lambda: {"count": 0, "dur_us": 0, "bytes": 0}
-    )
-    for stats in breakdowns:
-        for op, vals in stats.items():
-            merged[op]["count"] += vals.get("count", 0)
-            merged[op]["dur_us"] += vals.get("dur_us", 0)
-            merged[op]["bytes"] += vals.get("bytes", 0)
-    return dict(merged)
-
-
-def plot_collective_ops_breakdown_stats(
+def plot_comm_breakdown_stats(
     stats: dict[str, dict[str, float | int]],
     out_path: Path,
     *,
     title: str,
 ) -> None:
-    """Bar chart from pre-aggregated comm_operation_breakdown stats."""
+    """Bar chart from pre-aggregated comm op stats."""
     if not stats:
         return
     ops = sorted(stats.keys(), key=lambda k: stats[k]["dur_us"], reverse=True)
@@ -1121,6 +1223,16 @@ def plot_collective_ops_breakdown_stats(
     fig.suptitle(title, fontsize=12, y=1.02)
     plt.tight_layout()
     save_figure(fig, out_path)
+
+
+def plot_collective_ops_breakdown_stats(
+    stats: dict[str, dict[str, float | int]],
+    out_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Alias for plot_comm_breakdown_stats."""
+    plot_comm_breakdown_stats(stats, out_path, title=title)
 
 
 def plot_duty_by_node(

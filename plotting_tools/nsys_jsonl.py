@@ -147,7 +147,9 @@ def load_nsys_jsonl(
                     report.skipped_nvtx_names[skip_name] += 1
                 continue
 
-            kind, sub = classify_event(name, cat, uncl if strict else None)
+            kind, sub = classify_event(
+                name, cat, uncl if strict else None, args=extra
+            )
             events.append(
                 {
                     "name": name,
