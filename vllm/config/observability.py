@@ -76,19 +76,12 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
-    track_moe_stats: bool = False
-    """Enable JSONL tracing for MoE router/top-k selection stats."""
+    jit_monitor_mode: Literal["warn", "error"] = "warn"
+    """How to handle post-warmup JIT compilation events."""
 
-    track_moe_stats_dir: str | None = None
-    """Optional output directory for MoE stats traces.
-    Defaults to `<repo_root>/traces` when not provided.
-    """
-
-    track_gpu_op_timings: bool = False
-    """Enable CUDA event timings for key GPU operations."""
-
-    track_gpu_coll_op_timings: bool = False
-    """Enable CUDA event timings for GPU collective communication ops."""
+    jit_monitor_verbose: bool = False
+    """Log every monitored JIT compile with runtime details. This can emit many
+    logs and add overhead, so it is intended for debugging."""
 
     @cached_property
     def collect_model_forward_time(self) -> bool:
