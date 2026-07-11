@@ -6,6 +6,7 @@ import os
 import random
 import threading
 from collections.abc import Callable, Collection
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
@@ -13,6 +14,7 @@ import numpy.typing as npt
 import torch
 from packaging import version
 from packaging.version import Version
+from torch.autograd.profiler import record_function
 from torch.library import Library, infer_schema
 
 import vllm.envs as envs
@@ -70,6 +72,27 @@ T = TypeVar("T")
 
 
 PIN_MEMORY = is_pin_memory_available()
+
+_PROFILER_FUNC = None
+
+
+def record_function_or_nullcontext(name: str) -> AbstractContextManager:
+    global _PROFILER_FUNC
+
+    # Fast path assumes it is set.
+    if _PROFILER_FUNC is not None:
+        return _PROFILER_FUNC(name)
+
+    func = contextlib.nullcontext
+    if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
+        func = record_function
+    elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
+        import nvtx
+
+        func = nvtx.annotate
+
+    _PROFILER_FUNC = func
+    return func(name)
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:

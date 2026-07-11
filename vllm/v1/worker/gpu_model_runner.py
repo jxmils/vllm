@@ -3836,6 +3836,43 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _get_batch_phase_tag(
+        self,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> str:
+        num_reqs = self.input_batch.num_reqs
+        scheduled = num_scheduled_tokens_np[:num_reqs]
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        prompt = self.input_batch.num_prompt_tokens[:num_reqs]
+
+        prompt_remaining = np.maximum(prompt - computed, 0)
+        prefill_tokens = np.minimum(scheduled, prompt_remaining)
+        decode_tokens = np.maximum(scheduled - prefill_tokens, 0)
+
+        n_prefill_reqs = int(np.count_nonzero(prefill_tokens))
+        n_decode_reqs = int(np.count_nonzero(decode_tokens))
+        n_prefill_tokens = int(prefill_tokens.sum())
+        n_decode_tokens = int(decode_tokens.sum())
+        total_tokens = int(scheduled.sum())
+        max_query_len = int(scheduled.max()) if scheduled.size else 0
+
+        if n_prefill_tokens and n_decode_tokens:
+            phase = "mixed"
+        elif n_prefill_tokens:
+            phase = "prefill"
+        else:
+            phase = "decode"
+
+        return (
+            f"vllm:phase={phase};"
+            f"prefill_tokens={n_prefill_tokens};"
+            f"decode_tokens={n_decode_tokens};"
+            f"prefill_reqs={n_prefill_reqs};"
+            f"decode_reqs={n_decode_reqs};"
+            f"total_tokens={total_tokens};"
+            f"max_query_len={max_query_len}"
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4153,11 +4190,13 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            phase_tag = self._get_batch_phase_tag(num_scheduled_tokens_np)
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            with record_function_or_nullcontext(f"{phase_tag}:prepare_inputs"):
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4281,21 +4320,24 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
+            with record_function_or_nullcontext(
+                f"{phase_tag}:build_attention_metadata"
+            ):
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                    )
                 )
-            )
 
             (
                 input_ids,
@@ -4348,6 +4390,7 @@ class GPUModelRunner(
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
+            record_function_or_nullcontext(f"{phase_tag}:target_model_forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,

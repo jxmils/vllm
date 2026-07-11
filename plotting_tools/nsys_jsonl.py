@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from plotting_tools.classify import CONTROL_PATTERNS, classify_event
+from plotting_tools.classify import EXCLUDE_CONTROL_PATTERNS, classify_event
 from plotting_tools.classify_report import ClassificationReport
 from plotting_tools.comm_nvtx import parse_comm_nvtx_label, parse_iter_nvtx_label
 
@@ -19,14 +19,9 @@ _MEMCPY_KIND = {
     4: "memcpy default",
     5: "memcpy host",
     6: "memcpy device",
+    # Seen in Nsight JSONL for device-to-device copies (srcKind=dstKind=device).
+    8: "memcpy dtod",
 }
-
-_RUNTIME_COMM_HINTS = (
-    "nccl",
-    "cudamemcpy",
-    "cudamemcpyasync",
-    "cudamemcpy2d",
-)
 
 # vLLM iteration_nvtx_range() outer step labels (VLLM_ITERATION_NVTX=1)
 _ITERATION_NVTX_NAMES = frozenset({"prefill", "decode", "mixed", "idle"})
@@ -214,14 +209,8 @@ def load_nsys_jsonl(
             elif table == "CUPTI_ACTIVITY_KIND_RUNTIME":
                 name = strings.get(int(row["nameId"]), "")
                 lower = name.lower()
-                if "pytorch profiler" in lower:
+                if any(pattern in lower for pattern in EXCLUDE_CONTROL_PATTERNS):
                     report.skipped_rows["profiler"] += 1
-                    continue
-                comm_hit = any(h in lower for h in _RUNTIME_COMM_HINTS)
-                control_hit = any(h in lower for h in CONTROL_PATTERNS)
-                if not comm_hit and not control_hit:
-                    report.skipped_rows["runtime_unmatched"] += 1
-                    report.skipped_runtime_names[name[:500] or "(empty)"] += 1
                     continue
                 cat = "runtime"
             else:

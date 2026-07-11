@@ -8,7 +8,6 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import connection
 from multiprocessing.process import BaseProcess
@@ -24,14 +23,13 @@ from typing import (
 
 import torch
 import uvloop
-from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
-from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.utils.torch_utils import PIN_MEMORY, record_function_or_nullcontext
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -739,28 +737,6 @@ def report_usage_stats(
             "num_experts": model_config.get_num_experts(),
         },
     )
-
-
-_PROFILER_FUNC = None
-
-
-def record_function_or_nullcontext(name: str) -> AbstractContextManager:
-    global _PROFILER_FUNC
-
-    # fast path assume it is set
-    if _PROFILER_FUNC is not None:
-        return _PROFILER_FUNC(name)
-
-    func = contextlib.nullcontext
-    if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
-        func = record_function
-    elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
-        import nvtx
-
-        func = nvtx.annotate
-
-    _PROFILER_FUNC = func
-    return func(name)
 
 
 def tensor_data(tensor: torch.Tensor) -> memoryview:

@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
+    record_function_or_nullcontext,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -781,13 +782,16 @@ def unified_kv_cache_update(
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            attn_layer,
-            key,
-            value,
-            kv_cache,
-            layer_slot_mapping,
-        )
+        with record_function_or_nullcontext(
+            f"vllm:kv_cache_update;layer={layer_name}"
+        ):
+            attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
@@ -827,17 +831,20 @@ def unified_attention_with_output(
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
-    self.impl.forward(
-        self,
-        query,
-        key,
-        value,
-        kv_cache,
-        attn_metadata,
-        output=output,
-        output_scale=output_scale,
-        output_block_scale=output_block_scale,
-    )
+    with record_function_or_nullcontext(
+        f"vllm:attention;layer={layer_name};backend={self.backend.name}"
+    ):
+        self.impl.forward(
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        )
 
 
 def unified_attention_with_output_fake(

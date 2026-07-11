@@ -28,6 +28,8 @@ Subcategory = Literal[
 # Legacy alias used in a few plot paths (maps to network_collective in timelines).
 LEGACY_COLLECTIVE_COMM = "network_collective"
 
+EXCLUDE_CONTROL_PATTERNS = {"pytorch profiler"}
+
 COMPUTE_PATTERNS = (
     "vectorized_elementwise_kernel",
     "unrolled_elementwise_kernel",
@@ -48,12 +50,20 @@ COMPUTE_PATTERNS = (
     "vllm::modified_torch_code::mbtopk::",
     "flashattnvarlenfunc",
     "_layer_norm_kernel",
+    "gemm",
+    "cutlass::device_kernel",
+    "cublas",
+    "rotary_embedding",
+    "top2_sum_gate",
     "reduce_fused_impl",
     "reduce_kernel",
     "devicescan",
     "devicescankernel",
     "scatter",
     "gather",
+    "clean_and_count_expert",
+    "get_fused_mapping",
+    "get_dispatch_layout",
     "per_token_cast_to_fp8",
     "swiglu_forward",
     "compute_attn_ws",
@@ -69,9 +79,6 @@ COMPUTE_PATTERNS = (
     "cudamemsetasync",
     "memset (device)",
     "gpu_memset",
-    "flashinfer",
-    "fmha",
-    "paged_attention",
 )
 
 MATMUL_GEMM_PATTERNS = (
@@ -148,21 +155,25 @@ COMM_PATTERNS = (
     "nccl:",
     "nccl::",
     "nccldevkernel",
+    "memcpy htod",
+    "memcpy dtoh",
     "memcpy dtod",
     "gpu_memcpy",
     "dpsk::ep::internode::dispatch_ll",
     "dpsk::ep::internode::combine_ll",
     "notify_dispatch",
     "cached_notify",
-    "send_tensor",
-    "recv_tensor",
-    "isend",
-    "irecv",
 )
 
 CONTROL_PATTERNS = (
     "c10d::allreduce_",
     "record_param_comms",
+    "aten::item",
+    "aten::_local_scalar_dense",
+    "aten::sort",
+    "aten::where",
+    "aten::nonzero",
+    "aten::masked_select",
     "aten::",
     "detach_",
     "cudaeventquery",
@@ -183,14 +194,130 @@ CONTROL_PATTERNS = (
     "cudagetfuncbysymbol",
     "cudagraphlaunch",
     "cudadrivergetversion",
+    "cukernelgetname",
+    "cukernelgetattribute",
+    "cutensormapencodetiled",
+    "cudathreadexchangestreamcapturemode_v10010",
+    "cugetprocaddress_v2",
+    "cudaeventrecord_v3020",
+    "cumemaddressreserve",
+    "cumemmap",
+    "cumemsetaccess",
+    "cumemgetallocationgranularity",
+    "cumemcreate",
+    "cudamalloc_v3020",
+    "cudaeventcreatewithflags_v3020",
+    "cudastreamcreatewithpriority_v5050",
+    "cudastreamgetcaptureinfo_v3_v12030",
+    "cumemimportfromshareablehandle",
+    "cudaeventrecordwithflags_v11010",
+    "cudaeventdestroy_v3020",
+    "cudaeventsynchronize_v3020",
+    "cudagetdriverentrypointbyversion_v12050",
+    "cudahostalloc_v3020",
+    "culibrarygetkernel",
+    "culibraryloaddata",
+    "cudagetdeviceproperties_v2_v12000",
+    "cukernelsetattribute",
+    "cudastreamcreatewithflags_v5000",
+    "cudafree_v3020",
+    "cumulticastadddevice",
+    "cudamemset_v3020",
+    "cumulticastbindmem",
+    "cumodulegetloadingmode",
+    "cuinit",
+    "cudamempoolcreate_v11020",
+    "cudamempoolsetattribute_v11020",
+    "cumulticastgetgranularity",
+    "cudamemcpy_v3020",
+    "cumoduleloaddata",
+    "cumemexporttoshareablehandle",
+    "cumemrelease",
+    "cudamemgetinfo_v3020",
+    "cumulticastcreate",
     "allgatherprefix",
     "reducescatterprefix",
     "pytorch profiler",
     "invalid cuda_runtime",
     "cudamemcpyasync",
-    "memcpy htod",
-    "memcpy dtoh",
 )
+
+CONTROL_FAMILY = {
+    "c10d::allreduce_": "collective_setup",
+    "record_param_comms": "collective_setup",
+    "allgatherprefix": "collective_setup",
+    "reducescatterprefix": "collective_setup",
+    "cudalaunchkernel": "kernel_launch",
+    "culaunchkernel": "kernel_launch",
+    "cudalaunchkernelexc": "kernel_launch",
+    "cudagraphlaunch": "kernel_launch",
+    "cudaeventquery": "sync_poll",
+    "cudastreamwaitevent": "sync_poll",
+    "cudastreamsynchronize": "sync_poll",
+    "cudadevicesynchronize": "sync_poll",
+    "cudastreamiscapturing": "runtime_meta",
+    "cudastreamgetcaptureinfo_v2": "runtime_meta",
+    "cudafuncgetattributes": "runtime_meta",
+    "cudafuncsetattribute": "runtime_meta",
+    "cudadevicegetattribute": "runtime_meta",
+    "cudapointergetattributes": "runtime_meta",
+    "cudaoccupancymaxactiveblockspermultiprocessorwithflags": "runtime_meta",
+    "cudapeekatlasterror": "runtime_meta",
+    "cudagetfuncbysymbol": "runtime_meta",
+    "cudadrivergetversion": "runtime_meta",
+    "cukernelgetname": "runtime_meta",
+    "cukernelgetattribute": "runtime_meta",
+    "cutensormapencodetiled": "runtime_meta",
+    "cudathreadexchangestreamcapturemode_v10010": "runtime_meta",
+    "cugetprocaddress_v2": "runtime_meta",
+    "cudaeventrecord_v3020": "sync_poll",
+    "cumemaddressreserve": "memory_mgmt",
+    "cumemmap": "memory_mgmt",
+    "cumemsetaccess": "memory_mgmt",
+    "cumemgetallocationgranularity": "memory_mgmt",
+    "cumemcreate": "memory_mgmt",
+    "cudamalloc_v3020": "memory_mgmt",
+    "cudaeventcreatewithflags_v3020": "runtime_meta",
+    "cudastreamcreatewithpriority_v5050": "runtime_meta",
+    "cudastreamgetcaptureinfo_v3_v12030": "runtime_meta",
+    "cumemimportfromshareablehandle": "memory_mgmt",
+    "cudaeventrecordwithflags_v11010": "sync_poll",
+    "cudaeventdestroy_v3020": "runtime_meta",
+    "cudaeventsynchronize_v3020": "sync_poll",
+    "cudagetdriverentrypointbyversion_v12050": "runtime_meta",
+    "cudahostalloc_v3020": "memory_mgmt",
+    "culibrarygetkernel": "runtime_meta",
+    "culibraryloaddata": "runtime_meta",
+    "cudagetdeviceproperties_v2_v12000": "runtime_meta",
+    "cukernelsetattribute": "runtime_meta",
+    "cudastreamcreatewithflags_v5000": "runtime_meta",
+    "cudafree_v3020": "memory_mgmt",
+    "cumulticastadddevice": "fabric_setup",
+    "cudamemset_v3020": "runtime_memory_op",
+    "cumulticastbindmem": "fabric_setup",
+    "cumodulegetloadingmode": "runtime_meta",
+    "cuinit": "runtime_meta",
+    "cudamempoolcreate_v11020": "memory_mgmt",
+    "cudamempoolsetattribute_v11020": "memory_mgmt",
+    "cumulticastgetgranularity": "fabric_setup",
+    "cudamemcpy_v3020": "runtime_memory_op",
+    "cumoduleloaddata": "runtime_meta",
+    "cumemexporttoshareablehandle": "memory_mgmt",
+    "cumemrelease": "memory_mgmt",
+    "cudamemgetinfo_v3020": "memory_mgmt",
+    "cumulticastcreate": "fabric_setup",
+    "aten::item": "data_dependent",
+    "aten::_local_scalar_dense": "data_dependent",
+    "aten::sort": "data_dependent",
+    "aten::where": "data_dependent",
+    "aten::nonzero": "data_dependent",
+    "aten::masked_select": "data_dependent",
+    "aten::": "framework_bookkeeping",
+    "detach_": "framework_bookkeeping",
+    "pytorch profiler": "framework_bookkeeping",
+    "invalid cuda_runtime": "framework_bookkeeping",
+    "cudamemcpyasync": "runtime_meta",
+}
 
 ATTENTION_PATTERNS = (
     "flashattn",
@@ -330,6 +457,16 @@ _COLLECTIVE_SIGNALS = (
 _KERNEL_COLLECTIVE_SIGNALS = _NETWORK_KERNEL_SIGNALS
 
 
+def first_match_control_pattern(s: str) -> str | None:
+    """Return the first matching control pattern, excluding ignored patterns."""
+    for pattern in CONTROL_PATTERNS:
+        if pattern in EXCLUDE_CONTROL_PATTERNS:
+            continue
+        if pattern in s:
+            return pattern
+    return None
+
+
 def _memcpy_is_host_transfer(name: str, *, args: dict[str, Any] | None) -> bool:
     name_l = name.lower().strip()
     if "htod" in name_l or "dtoh" in name_l:
@@ -459,21 +596,8 @@ def classify_kind(
     s = f"{name} {cat}".lower()
     cat_l = cat.lower()
 
-    if cat_l == "memcpy" or (
-        name.lower().strip() == "memcpy" and "nccl" not in s
-    ):
-        if _memcpy_is_host_transfer(name, args=args):
-            return "control"
-        return "comm"
-
-    if _is_network_kernel_or_runtime(name, cat):
-        return "comm"
-
     if any(k in s for k in COMM_PATTERNS):
         return "comm"
-
-    if "memcpy htod" in s or "memcpy dtoh" in s:
-        return "control"
 
     if cat_l == "kernel":
         return "compute"
@@ -540,16 +664,14 @@ def classify_event(
     *,
     args: dict[str, Any] | None = None,
 ) -> tuple[Kind, Subcategory]:
+    s = f"{name} {cat}".lower()
     kind = classify_kind(name, cat, args=args)
     sub = classify_subcategory(name, cat, kind, args=args)
-    if unclassified is not None and kind == "control" and sub == "control":
-        if not any(k in f"{name} {cat}".lower() for k in CONTROL_PATTERNS):
+    if unclassified is not None and kind == "control":
+        if not any(k in s for k in CONTROL_PATTERNS):
             if cat.lower() != "kernel":
-                if not any(
-                    k in f"{name} {cat}".lower()
-                    for k in COMM_PATTERNS + COMPUTE_PATTERNS
-                ):
-                    unclassified.append(f"{name} {cat}".lower())
+                if not any(k in s for k in COMM_PATTERNS + COMPUTE_PATTERNS):
+                    unclassified.append(s)
     return kind, sub
 
 

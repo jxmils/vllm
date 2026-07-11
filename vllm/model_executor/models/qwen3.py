@@ -46,6 +46,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import set_default_rope_theta
+from vllm.utils.torch_utils import record_function_or_nullcontext
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
@@ -153,18 +154,37 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:qkv_proj;layer={self.qkv_proj.prefix}"
+        ):
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:qk_norm_rope;layer={self.attn.layer_name}"
+        ):
+            q_by_head = q.view(
+                *q.shape[:-1],
+                q.shape[-1] // self.head_dim,
+                self.head_dim,
+            )
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(
+                *k.shape[:-1],
+                k.shape[-1] // self.head_dim,
+                self.head_dim,
+            )
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+            q, k = self.rotary_emb(positions, q, k)
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:attention;layer={self.attn.layer_name}"
+        ):
+            attn_output = self.attn(q, k, v)
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:o_proj;layer={self.o_proj.prefix}"
+        ):
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -177,6 +197,7 @@ class Qwen3DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.prefix = prefix
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(
@@ -226,19 +247,31 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:decoder_self_attn;layer={self.prefix}"
+        ):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states,
+                    residual,
+                )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        with record_function_or_nullcontext(
+            f"vllm:qwen3:decoder_mlp;layer={self.prefix}"
+        ):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states,
+                residual,
+            )
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
