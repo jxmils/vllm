@@ -76,6 +76,15 @@ PIN_MEMORY = is_pin_memory_available()
 _PROFILER_FUNC = None
 
 
+@contextlib.contextmanager
+def _cuda_nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     global _PROFILER_FUNC
 
@@ -87,9 +96,7 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
         func = record_function
     elif envs.VLLM_NVTX_SCOPES_FOR_PROFILING:
-        import nvtx
-
-        func = nvtx.annotate
+        func = _cuda_nvtx_range
 
     _PROFILER_FUNC = func
     return func(name)
