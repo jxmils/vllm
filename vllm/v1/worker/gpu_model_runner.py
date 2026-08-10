@@ -49,6 +49,14 @@ from vllm.distributed.parallel_state import (
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
+from vllm.distributed.trace_context import (
+    BatchPhaseInfo,
+    IterationTraceContext,
+    batch_phase_nvtx_label,
+    iteration_nvtx_label,
+    iteration_trace_context,
+    make_iteration_trace_context,
+)
 from vllm.forward_context import (
     BatchDescriptor,
     set_forward_context,
@@ -931,6 +939,7 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+        self._trace_iteration_id = 0
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3836,10 +3845,10 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
-    def _get_batch_phase_tag(
+    def _get_batch_phase_info(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> str:
+    ) -> BatchPhaseInfo:
         num_reqs = self.input_batch.num_reqs
         scheduled = num_scheduled_tokens_np[:num_reqs]
         computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -3863,14 +3872,35 @@ class GPUModelRunner(
         else:
             phase = "decode"
 
-        return (
-            f"vllm:phase={phase};"
-            f"prefill_tokens={n_prefill_tokens};"
-            f"decode_tokens={n_decode_tokens};"
-            f"prefill_reqs={n_prefill_reqs};"
-            f"decode_reqs={n_decode_reqs};"
-            f"total_tokens={total_tokens};"
-            f"max_query_len={max_query_len}"
+        return BatchPhaseInfo(
+            phase=phase,
+            prefill_tokens=n_prefill_tokens,
+            decode_tokens=n_decode_tokens,
+            prefill_reqs=n_prefill_reqs,
+            decode_reqs=n_decode_reqs,
+            total_tokens=total_tokens,
+            max_query_len=max_query_len,
+            num_reqs=num_reqs,
+        )
+
+    def _make_iteration_trace_context(
+        self,
+        iteration_id: int,
+        phase_info: BatchPhaseInfo,
+    ) -> IterationTraceContext:
+        pp_rank = 0
+        tp_rank = 0
+        try:
+            pp_rank = get_pp_group().rank_in_group
+            tp_rank = get_tp_group().rank_in_group
+        except AssertionError:
+            pass
+        return make_iteration_trace_context(
+            iteration_id,
+            phase_info,
+            rank=self.parallel_config.rank,
+            pp=pp_rank,
+            tp=tp_rank,
         )
 
     def _determine_batch_execution_and_padding(
@@ -4190,7 +4220,13 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-            phase_tag = self._get_batch_phase_tag(num_scheduled_tokens_np)
+            phase_info = self._get_batch_phase_info(num_scheduled_tokens_np)
+            phase_tag = batch_phase_nvtx_label(phase_info)
+            iteration_id = self._trace_iteration_id
+            self._trace_iteration_id += 1
+            trace_context = self._make_iteration_trace_context(
+                iteration_id, phase_info
+            )
 
             with record_function_or_nullcontext(f"{phase_tag}:prepare_inputs"):
                 logits_indices, spec_decode_metadata = self._prepare_inputs(
@@ -4378,6 +4414,7 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
         with (
+            iteration_trace_context(trace_context),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -4389,6 +4426,7 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
             ),
+            record_function_or_nullcontext(iteration_nvtx_label(trace_context)),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             record_function_or_nullcontext(f"{phase_tag}:target_model_forward"),
             self.maybe_get_kv_connector_output(

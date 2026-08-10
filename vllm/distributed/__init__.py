@@ -3,4 +3,5 @@
 
 from .communication_op import *
 from .parallel_state import *
+from .trace_context import *
 from .utils import *

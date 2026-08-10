@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# Keep in sync with vllm/distributed/iteration_phase_nvtx.py comm ops.
+# Keep in sync with vllm/distributed/communication_op.py comm_nvtx_label().
 COMM_NVTX_OPS = frozenset({
     "send",
     "recv",
@@ -13,6 +13,8 @@ COMM_NVTX_OPS = frozenset({
     "pp_isend",
     "pp_irecv",
     "all_reduce",
+    "all_gather",
+    "reduce_scatter",
     "all_to_all_dispatch",
     "all_to_all_combine",
 })
@@ -36,6 +38,28 @@ LOW_LEVEL_TO_PP: dict[str, tuple[str, ...]] = {
 }
 
 BYTES_LABEL = "logical tensor bytes"
+
+
+def _parse_optional_int(fields: dict[str, str], key: str) -> int | None:
+    val = fields.get(key)
+    if val is None:
+        return None
+    return int(val)
+
+
+def _record_rank(record: dict[str, Any]) -> int | None:
+    rank = record.get("rank")
+    if rank is None:
+        return None
+    return int(rank)
+
+
+def _rank_compatible(record_rank: int | None, range_rank: int | None) -> bool:
+    if record_rank is not None and range_rank is not None:
+        return record_rank == range_rank
+    if record_rank is None and range_rank is not None:
+        return False
+    return True
 
 
 def _looks_like_shape(token: str) -> bool:
@@ -68,7 +92,7 @@ def parse_iter_nvtx_label(name: str) -> dict[str, Any] | None:
         "scope": "iteration",
         "iter_id": iter_id,
         "phase": phase,
-        "rank": int(fields.get("rank", "0")),
+        "rank": _parse_optional_int(fields, "rank"),
         "pp": int(fields.get("pp", "0")),
         "tp": int(fields.get("tp", "0")),
         "ctx_tokens": int(fields.get("ctx", "0")),
@@ -164,7 +188,7 @@ def _parse_comm_nvtx_label_pipe(name: str) -> dict[str, Any] | None:
         "shape": fields.get("shape", "-"),
         "logical_tensor_bytes": nbytes,
         "peer": peer,
-        "rank": int(fields.get("rank", "0")),
+        "rank": _parse_optional_int(fields, "rank"),
         "pp": int(fields.get("pp", "0")),
         "tp": int(fields.get("tp", "0")),
         "nvtx_name": name,
@@ -314,13 +338,13 @@ def assign_comm_phases_from_iteration(
     """
     For comm records with phase=unknown, assign prefill/decode/mixed.
 
-    1. Match ``iter_id`` when present on both comm and iteration records.
-    2. Prefer narrowest overlapping outer iteration NVTX range.
+    1. Match ``(rank, iter_id)`` when present on both comm and iteration records.
+    2. Prefer narrowest overlapping outer iteration NVTX range with compatible rank.
 
     Does **not** use nearest-gap fallback (unreliable; left as unknown).
     """
-    iter_id_to_phase: dict[int, str] = {}
-    phase_ranges: list[tuple[str, int, int, int, int | None]] = []
+    iter_id_to_phase: dict[tuple[int | None, int], str] = {}
+    phase_ranges: list[tuple[str, int, int, int, int | None, int | None]] = []
     for row in iteration_ranges:
         name = (row.get("name") or row.get("phase") or "").lower().strip()
         if name not in ("prefill", "decode", "mixed"):
@@ -329,17 +353,24 @@ def assign_comm_phases_from_iteration(
         end = int(row["end"])
         iter_id = row.get("iter_id")
         iter_id_int = int(iter_id) if iter_id is not None else None
+        rank = _record_rank(row)
         if iter_id_int is not None:
-            iter_id_to_phase[iter_id_int] = name
-        phase_ranges.append((name, start, end, end - start, iter_id_int))
+            iter_id_to_phase[(rank, iter_id_int)] = name
+        phase_ranges.append((name, start, end, end - start, iter_id_int, rank))
 
     assigned = 0
     for record in records:
         if record.get("phase") != "unknown":
             continue
         record_iter = record.get("iter_id")
-        if record_iter is not None:
-            phase = iter_id_to_phase.get(int(record_iter))
+        record_rank = _record_rank(record)
+        record_iter_int = int(record_iter) if record_iter is not None else None
+        if record_iter_int is not None and record_iter_int < 0:
+            continue
+        if record_iter_int is not None:
+            phase = iter_id_to_phase.get((record_rank, record_iter_int))
+            if phase is None and record_rank is not None:
+                phase = iter_id_to_phase.get((None, record_iter_int))
             if phase is not None:
                 record["phase"] = phase
                 record["phase_source"] = "iter_id"
@@ -349,7 +380,9 @@ def assign_comm_phases_from_iteration(
         end = int(record["end"])
         best: str | None = None
         best_span: int | None = None
-        for phase, range_start, range_end, span, _iter_id in phase_ranges:
+        for phase, range_start, range_end, span, _iter_id, rank in phase_ranges:
+            if not _rank_compatible(record_rank, rank):
+                continue
             if _intervals_overlap(start, end, range_start, range_end):
                 if best_span is None or span < best_span:
                     best = phase
